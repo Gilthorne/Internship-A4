@@ -1,9 +1,6 @@
-/articles_2010_with_data_files.csv
-/curl_debug.log
+/*.csv
+/*.log
 /elsevier_parse.php
 /llm.php
-/response_abstract.json
-/response_article.json
-/response_search.json
-/Things Learnt.docx
-/~$ings Learnt.docx
+/*.json
+/*.docx

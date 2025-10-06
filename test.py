@@ -99,12 +99,12 @@ def main():
         print("Exemple: python test.py 10.1016/j.seppur.2025.134949")
         return
     doi = sys.argv[1]
-    print(f"🔍 Analyse des fichiers pour DOI: {doi}")
+    print(f"Analyse des fichiers pour DOI: {doi}")
     try:
         subprocess.run(['php', 'd:/Internship A4/elsevier_parse.php', doi], check=True)
-        print("✅ Script PHP exécuté avec succès")
+        print("Script PHP exécuté avec succès")
     except subprocess.CalledProcessError:
-        print("❌ Erreur lors de l'exécution du script PHP")
+        print("Erreur lors de l'exécution du script PHP")
         return
     json_files = [
         'd:/Internship A4/response_article.json',
@@ -115,9 +115,9 @@ def main():
     repositories = extract_unique_repos(json_files)
     print("\n" + "=" * 60)
     if repositories or excel_csv_files:
-        print("✅ DONNÉES TROUVÉES!")
+        print("DONNÉES TROUVÉES!")
         if excel_csv_files:
-            print(f"📊 {len(excel_csv_files)} fichier(s) Excel/CSV:")
+            print(f"{len(excel_csv_files)} fichier(s) Excel/CSV:")
             already = set()
             for file in excel_csv_files:
                 if file['ref'] not in already:
@@ -129,8 +129,8 @@ def main():
                 repo_type = "GitHub" if "github.com" in repo else "Zenodo" if "zenodo.org" in repo else "Mendeley Data"
                 print(f"   - {repo_type}: {repo}")
     else:
-        print("❌ AUCUNE DONNÉE TROUVÉE")
-        print("   Ni fichiers Excel/CSV, ni liens vers GitHub/Zenodo/Mendeley Data")
+        print("AUCUNE DONNÉE TROUVÉE")
+        print("Ni fichiers Excel/CSV, ni liens vers GitHub/Zenodo/Mendeley Data")
 
 if __name__ == "__main__":
     main()

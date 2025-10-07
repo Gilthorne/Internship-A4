@@ -5,3 +5,8 @@
 /*.json
 /*.docx
 /*.zip
+/*.xlsx
+/*.xls
+/downloads/*
+/*/*.xls
+/*/*.csv

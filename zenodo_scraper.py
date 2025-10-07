@@ -43,15 +43,27 @@ def get_zenodo_files(zenodo_id):
     file_pattern = r'/records/\d+/files/([^"\']+?\.(?:xlsx?|csv))(?:\?[^"\']*)?'
     matches = re.findall(file_pattern, html_content, re.IGNORECASE)
     
+    # Utiliser un set pour éliminer les doublons
+    unique_files = set()
     files = []
+    
     for filename in matches:
-        # Construire l'URL complète de téléchargement
-        download_url = f"https://zenodo.org/records/{zenodo_id}/files/{filename}?download=1"
-        files.append({
-            'filename': filename,
-            'url': download_url,
-            'type': 'Excel' if filename.lower().endswith(('.xlsx', '.xls')) else 'CSV'
-        })
+        # Décoder les caractères URL encodés (comme %20 pour les espaces)
+        decoded_filename = urllib.parse.unquote(filename)
+        
+        # Éviter les doublons
+        if decoded_filename not in unique_files:
+            unique_files.add(decoded_filename)
+            
+            # Encoder correctement l'URL pour le téléchargement
+            encoded_filename = urllib.parse.quote(decoded_filename)
+            download_url = f"https://zenodo.org/records/{zenodo_id}/files/{encoded_filename}?download=1"
+            
+            files.append({
+                'filename': decoded_filename,  # Nom décodé pour l'affichage
+                'url': download_url,           # URL encodée pour le téléchargement
+                'type': 'Excel' if decoded_filename.lower().endswith(('.xlsx', '.xls')) else 'CSV'
+            })
     
     return files
 
@@ -59,6 +71,7 @@ def download_file(file_info, download_dir="downloads"):
     """Télécharge un fichier"""
     if not os.path.exists(download_dir):
         os.makedirs(download_dir)
+        print(f"Dossier créé: {os.path.abspath(download_dir)}")
     
     filename = file_info['filename']
     url = file_info['url']
@@ -66,6 +79,7 @@ def download_file(file_info, download_dir="downloads"):
     
     try:
         print(f"Téléchargement: {filename}")
+        print(f"   -> Vers: {os.path.abspath(filepath)}")
         urllib.request.urlretrieve(url, filepath)
         file_size = os.path.getsize(filepath)
         print(f"Téléchargé: {filename} ({file_size} bytes)")
@@ -82,30 +96,38 @@ def process_zenodo_record(input_value, download=False):
         print("ID Zenodo non valide")
         return
     
-    print(f" Analyse du record Zenodo: {zenodo_id}")
-    print(f" URL: https://zenodo.org/records/{zenodo_id}")
+    print(f"Analyse du record Zenodo: {zenodo_id}")
+    print(f"URL: https://zenodo.org/records/{zenodo_id}")
     
     files = get_zenodo_files(zenodo_id)
     
     if not files:
-        print(" Aucun fichier Excel/CSV trouvé sur cette page Zenodo")
+        print("Aucun fichier Excel/CSV trouvé sur cette page Zenodo")
         return
     
-    print(f"\n {len(files)} fichier(s) Excel/CSV trouvé(s):")
+    print(f"\n{len(files)} fichier(s) Excel/CSV unique(s) trouvé(s):")
     for i, file_info in enumerate(files, 1):
         print(f"   {i}. {file_info['type']}: {file_info['filename']}")
-        print(f"      URL: {file_info['url']}")
     
     if download:
-        print(f"\n Téléchargement des fichiers...")
+        download_dir = "downloads"
+        print(f"\nTéléchargement des fichiers dans: {os.path.abspath(download_dir)}")
         success_count = 0
         for file_info in files:
-            if download_file(file_info):
+            if download_file(file_info, download_dir):
                 success_count += 1
         
-        print(f"\n {success_count}/{len(files)} fichiers téléchargés avec succès")
+        print(f"\n{success_count}/{len(files)} fichiers téléchargés avec succès")
+        print(f"Vérifiez le dossier: {os.path.abspath(download_dir)}")
+        
+        # Lister les fichiers effectivement présents
+        if os.path.exists(download_dir):
+            actual_files = [f for f in os.listdir(download_dir) if f.endswith(('.xlsx', '.xls', '.csv'))]
+            print(f"Fichiers Excel/CSV trouvés sur disque: {len(actual_files)}")
+            for f in actual_files:
+                print(f"   - {f}")
     else:
-        print(f"\n Pour télécharger, utilisez: python zenodo_scraper.py {input_value} --download")
+        print(f"\nPour télécharger, utilisez: python zenodo_scraper.py {input_value} --download")
 
 def main():
     if len(sys.argv) < 2:

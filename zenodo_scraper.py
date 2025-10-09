@@ -71,18 +71,17 @@ def download_file(file_info, download_dir="downloads"):
     """Télécharge un fichier"""
     if not os.path.exists(download_dir):
         os.makedirs(download_dir)
-        print(f"Dossier créé: {os.path.abspath(download_dir)}")
     
     filename = file_info['filename']
     url = file_info['url']
     filepath = os.path.join(download_dir, filename)
     
+    # Vérifier si le fichier existe déjà
+    if os.path.exists(filepath):
+        return False  # Fichier déjà existant, ne pas télécharger
+    
     try:
-        print(f"Téléchargement: {filename}")
-        print(f"   -> Vers: {os.path.abspath(filepath)}")
         urllib.request.urlretrieve(url, filepath)
-        file_size = os.path.getsize(filepath)
-        print(f"Téléchargé: {filename} ({file_size} bytes)")
         return True
     except Exception as e:
         print(f"Erreur téléchargement {filename}: {e}")
@@ -111,21 +110,20 @@ def process_zenodo_record(input_value, download=False):
     
     if download:
         download_dir = "downloads"
-        print(f"\nTéléchargement des fichiers dans: {os.path.abspath(download_dir)}")
         success_count = 0
+        skipped_count = 0
+        
         for file_info in files:
-            if download_file(file_info, download_dir):
-                success_count += 1
+            filepath = os.path.join(download_dir, file_info['filename'])
+            if os.path.exists(filepath):
+                skipped_count += 1
+            else:
+                if download_file(file_info, download_dir):
+                    success_count += 1
         
-        print(f"\n{success_count}/{len(files)} fichiers téléchargés avec succès")
-        print(f"Vérifiez le dossier: {os.path.abspath(download_dir)}")
-        
-        # Lister les fichiers effectivement présents
-        if os.path.exists(download_dir):
-            actual_files = [f for f in os.listdir(download_dir) if f.endswith(('.xlsx', '.xls', '.csv'))]
-            print(f"Fichiers Excel/CSV trouvés sur disque: {len(actual_files)}")
-            for f in actual_files:
-                print(f"   - {f}")
+        print(f"\n{success_count} fichier(s) téléchargés")
+        if skipped_count > 0:
+            print(f"{skipped_count} fichier(s) ignorés (déjà existants)")
     else:
         print(f"\nPour télécharger, utilisez: python zenodo_scraper.py {input_value} --download")
 

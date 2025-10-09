@@ -53,6 +53,7 @@ def download_github_zip(owner, repo, download_dir="downloads"):
 def extract_excel_csv_from_zip(zip_path, download_dir="downloads"):
     """Extrait seulement les fichiers Excel/CSV du ZIP"""
     extracted_files = []
+    skipped_files = 0
     
     try:
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
@@ -62,27 +63,22 @@ def extract_excel_csv_from_zip(zip_path, download_dir="downloads"):
             # Filtrer pour ne garder que Excel/CSV
             excel_csv_files = [f for f in all_files if f.lower().endswith(('.xlsx', '.xls', '.csv'))]
             
-            print(f"Fichiers Excel/CSV trouvés dans le ZIP: {len(excel_csv_files)}")
-            
             for file_path in excel_csv_files:
                 # Extraire juste le nom du fichier (sans le chemin du repo)
                 filename = os.path.basename(file_path)
+                filepath = os.path.join(download_dir, filename)
                 
-                # Éviter les doublons
-                counter = 1
-                base_filename = filename
-                while os.path.exists(os.path.join(download_dir, filename)):
-                    name, ext = os.path.splitext(base_filename)
-                    filename = f"{name}_{counter}{ext}"
-                    counter += 1
+                # Vérifier si le fichier existe déjà
+                if os.path.exists(filepath):
+                    skipped_files += 1
+                    continue
                 
                 # Extraire le fichier
                 try:
-                    with zip_ref.open(file_path) as source, open(os.path.join(download_dir, filename), 'wb') as target:
+                    with zip_ref.open(file_path) as source, open(filepath, 'wb') as target:
                         target.write(source.read())
                     
-                    file_size = os.path.getsize(os.path.join(download_dir, filename))
-                    print(f"Extrait: {filename} ({file_size} bytes)")
+                    file_size = os.path.getsize(filepath)
                     extracted_files.append({
                         'filename': filename,
                         'original_path': file_path,
@@ -92,11 +88,11 @@ def extract_excel_csv_from_zip(zip_path, download_dir="downloads"):
                 except Exception as e:
                     print(f"Erreur extraction {file_path}: {e}")
         
-        return extracted_files
+        return extracted_files, skipped_files
         
     except Exception as e:
         print(f"Erreur lecture ZIP: {e}")
-        return []
+        return [], 0
 
 def process_github_repo(input_value, download=True):
     """Traite un repo GitHub et télécharge/extrait les fichiers Excel/CSV"""
@@ -125,18 +121,18 @@ def process_github_repo(input_value, download=True):
         return
     
     # Étape 2: Extraire les fichiers Excel/CSV
-    extracted_files = extract_excel_csv_from_zip(zip_path, download_dir)
+    extracted_files, skipped_files = extract_excel_csv_from_zip(zip_path, download_dir)
     
     # Étape 3: Supprimer le ZIP
     try:
         os.remove(zip_path)
-        print(f"ZIP supprimé: {zip_path}")
     except:
         pass
     
     # Étape 4: Rapport final
-    print(f"\n{len(extracted_files)} fichier(s) Excel/CSV extraits avec succès")
-    print(f"Dossier: {os.path.abspath(download_dir)}")
+    print(f"\n{len(extracted_files)} fichier(s) Excel/CSV téléchargés")
+    if skipped_files > 0:
+        print(f"{skipped_files} fichier(s) ignorés (déjà existants)")
     
     if extracted_files:
         print("\nFichiers extraits:")

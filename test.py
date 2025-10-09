@@ -96,7 +96,6 @@ def check_for_excel_csv_files(json_files):
 def main():
     if len(sys.argv) != 2:
         print("Usage: python test.py <DOI>")
-        print("Exemple: python test.py 10.1016/j.seppur.2025.134949")
         return
     doi = sys.argv[1]
     print(f"Analyse des fichiers pour DOI: {doi}")
@@ -129,7 +128,6 @@ def main():
                 repo_type = "GitHub" if "github.com" in repo else "Zenodo" if "zenodo.org" in repo else "Mendeley Data"
                 print(f"   - {repo_type}: {repo}")
     else:
-        print("AUCUNE DONNÉE TROUVÉE")
         print("Ni fichiers Excel/CSV, ni liens vers GitHub/Zenodo/Mendeley Data")
 
 if __name__ == "__main__":

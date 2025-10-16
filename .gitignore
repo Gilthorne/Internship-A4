@@ -10,3 +10,5 @@
 /downloads/*
 /*/*.xls
 /*/*.csv
+/*.txt
+/__pycache__/*

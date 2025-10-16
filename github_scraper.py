@@ -1,72 +1,86 @@
-import urllib.request
 import re
 import sys
-import os
-import zipfile
-import tempfile
+import requests
+from urllib.parse import urlparse
 
-def extract_github_info(url_or_repo):
-    """Extrait les informations GitHub depuis une URL ou nom de repo"""
-    patterns = [
-        r'github\.com/([^/]+)/([^/\s]+)',  # https://github.com/user/repo
-        r'^([^/]+)/([^/\s]+)$',            # user/repo
-    ]
+def extract_repo_info(github_url):
+    """Extrait le nom d'utilisateur et le nom du repo à partir d'une URL GitHub"""
+    # Nettoyer l'URL
+    parsed_url = urlparse(github_url)
+    if parsed_url.netloc != 'github.com':
+        return None, None
     
-    for pattern in patterns:
-        match = re.search(pattern, url_or_repo)
-        if match:
-            return match.group(1), match.group(2)
+    # Extraire les parties du chemin
+    path_parts = [part for part in parsed_url.path.split('/') if part]
+    if len(path_parts) < 2:
+        return None, None
     
-    return None, None
+    # Les deux premières parties sont l'utilisateur et le repo
+    return path_parts[0], path_parts[1]
 
-def check_github_data(url_or_repo):
-    """Vérifie si un repo GitHub contient des fichiers Excel/CSV SANS télécharger"""
-    owner, repo = extract_github_info(url_or_repo)
+def has_excel_csv_files(github_url):
+    """Vérifie si le dépôt GitHub contient des fichiers Excel/CSV et retourne la liste"""
+    username, repo = extract_repo_info(github_url)
     
-    if not owner or not repo:
-        print("URL GitHub non valide")
-        return
+    if not username or not repo:
+        print(f"URL GitHub invalide: {github_url}")
+        return False, []
     
-    print(f"Analyse du repo GitHub: {owner}/{repo}")
+    # Utiliser l'API GitHub pour récupérer les fichiers
+    api_url = f"https://api.github.com/repos/{username}/{repo}/git/trees/main?recursive=1"
     
-    # Essayer les branches main et master
-    for branch in ['main', 'master']:
-        try:
-            zip_url = f"https://github.com/{owner}/{repo}/archive/refs/heads/{branch}.zip"
-            
-            with urllib.request.urlopen(zip_url, timeout=10) as response:
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp_file:
-                    tmp_file.write(response.read())
-                    tmp_path = tmp_file.name
-            
-            # Vérifier le contenu du ZIP
-            file_count = 0
-            with zipfile.ZipFile(tmp_path, 'r') as zip_ref:
-                files = zip_ref.namelist()
-                excel_csv = [f for f in files if f.lower().endswith(('.xlsx', '.xls', '.csv'))]
-                file_count = len(excel_csv)
-            
-            # Supprimer le ZIP immédiatement
-            os.unlink(tmp_path)
-            
-            if file_count > 0:
-                print(f"\n{file_count} fichier(s) Excel/CSV trouvé(s)")
-                return
-                
-        except Exception as e:
-            continue
+    try:
+        response = requests.get(api_url)
+        
+        # Si main n'est pas trouvé, essayer avec master
+        if response.status_code == 404:
+            api_url = f"https://api.github.com/repos/{username}/{repo}/git/trees/master?recursive=1"
+            response = requests.get(api_url)
+        
+        if response.status_code != 200:
+            print(f"Erreur lors de l'accès au dépôt: {response.status_code}")
+            return False, []
+        
+        data = response.json()
+        
+        if "tree" not in data:
+            print("Structure de réponse API inattendue")
+            return False, []
+        
+        # Chercher les fichiers Excel/CSV
+        excel_csv_files = []
+        for item in data["tree"]:
+            if item["type"] == "blob":
+                path = item["path"]
+                if re.search(r'\.(xlsx?|csv)$', path, re.IGNORECASE):
+                    excel_csv_files.append(path)
+        
+        return bool(excel_csv_files), excel_csv_files
     
-    print("\n0 fichier(s) Excel/CSV trouvé(s)")
+    except Exception as e:
+        print(f"Erreur: {str(e)}")
+        return False, []
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python github_scraper.py <GITHUB_URL_OR_REPO>")
-        print("Exemples:")
-        print("  python github_scraper.py https://github.com/user/repo")
-        print("  python github_scraper.py user/repo")
-        return
+        print("Usage: python github_scraper.py <GITHUB_REPO_URL>")
+        return False
     
-    check_github_data(sys.argv[1])
+    github_url = sys.argv[1]
+    has_files, file_list = has_excel_csv_files(github_url)
+    
+    # Afficher le résultat booléen
+    print(has_files)
+    
+    # Afficher la liste des fichiers trouvés
+    if has_files:
+        print("Fichiers Excel/CSV trouvés:")
+        for file in file_list:
+            print(f"- {file}")
+    else:
+        print("Aucun fichier Excel/CSV trouvé")
+    
+    return has_files
 
 if __name__ == "__main__":
     main()

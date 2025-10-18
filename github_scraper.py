@@ -1,6 +1,7 @@
 import re
 import sys
 import requests
+import os
 from urllib.parse import urlparse
 
 def extract_repo_info(github_url):
@@ -53,7 +54,10 @@ def has_excel_csv_files(github_url):
             if item["type"] == "blob":
                 path = item["path"]
                 if re.search(r'\.(xlsx?|csv)$', path, re.IGNORECASE):
-                    excel_csv_files.append(path)
+                    excel_csv_files.append({
+                        'path': path,
+                        'url': f"https://raw.githubusercontent.com/{username}/{repo}/main/{path}"
+                    })
         
         return bool(excel_csv_files), excel_csv_files
     
@@ -61,22 +65,61 @@ def has_excel_csv_files(github_url):
         print(f"Erreur: {str(e)}")
         return False, []
 
+def download_files(file_list, directory="downloads"):
+    """Télécharge les fichiers Excel/CSV trouvés"""
+    os.makedirs(directory, exist_ok=True)
+    downloaded_files = []
+    
+    for file_info in file_list:
+        try:
+            path = file_info['path']
+            url = file_info['url']
+            
+            print(f"Téléchargement de {path}...")
+            
+            # Créer les sous-répertoires si nécessaire
+            filepath = os.path.join(directory, path)
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            
+            # Télécharger le fichier
+            response = requests.get(url)
+            if response.status_code != 200:
+                print(f"Erreur: HTTP {response.status_code}")
+                continue
+            
+            with open(filepath, 'wb') as f:
+                f.write(response.content)
+            
+            print(f"Fichier téléchargé: {filepath}")
+            downloaded_files.append(filepath)
+            
+        except Exception as e:
+            print(f"Erreur lors du téléchargement de {file_info['path']}: {str(e)}")
+    
+    return downloaded_files
+
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python github_scraper.py <GITHUB_REPO_URL>")
+        print("Usage: python github_scraper.py <GITHUB_REPO_URL> [--download]")
         return False
     
     github_url = sys.argv[1]
+    download_option = "--download" in sys.argv
+    
     has_files, file_list = has_excel_csv_files(github_url)
     
-    # Afficher le résultat booléen
     print(has_files)
     
-    # Afficher la liste des fichiers trouvés
     if has_files:
-        print("Fichiers Excel/CSV trouvés:")
+        print(f"{len(file_list)} fichier(s) Excel/CSV trouvé(s):")
         for file in file_list:
-            print(f"- {file}")
+            print(f"- {file['path']}")
+        
+        # Télécharger les fichiers si demandé
+        if download_option:
+            print("\nTéléchargement des fichiers...")
+            downloaded = download_files(file_list)
+            print(f"\n{len(downloaded)}/{len(file_list)} fichiers téléchargés avec succès.")
     else:
         print("Aucun fichier Excel/CSV trouvé")
     

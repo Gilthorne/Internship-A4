@@ -2,6 +2,7 @@ import urllib.request
 import urllib.parse
 import re
 import sys
+import os
 
 def extract_zenodo_id(url_or_doi):
     """Extrait l'ID Zenodo depuis une URL ou DOI"""
@@ -24,6 +25,32 @@ def extract_zenodo_id(url_or_doi):
         return url_or_doi
         
     return None
+
+def download_files(file_list, zenodo_id, directory="downloads"):
+    """Télécharge les fichiers Excel/CSV trouvés"""
+    os.makedirs(directory, exist_ok=True)
+    downloaded_files = []
+    
+    base_url = f"https://zenodo.org/records/{zenodo_id}/files/"
+    
+    for filename in file_list:
+        try:
+            download_url = base_url + urllib.parse.quote(filename)
+            print(f"Téléchargement de {filename}...")
+            
+            # Créer le chemin de destination
+            filepath = os.path.join(directory, filename)
+            
+            # Télécharger le fichier
+            urllib.request.urlretrieve(download_url, filepath)
+            
+            print(f"Fichier téléchargé: {filepath}")
+            downloaded_files.append(filepath)
+            
+        except Exception as e:
+            print(f"Erreur lors du téléchargement de {filename}: {str(e)}")
+    
+    return downloaded_files
 
 def has_excel_csv_files(url_or_doi):
     """Vérifie si le record Zenodo contient des fichiers Excel ou CSV et retourne la liste"""
@@ -50,10 +77,12 @@ def has_excel_csv_files(url_or_doi):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python zenodo_scraper.py <ZENODO_URL_OR_DOI>")
+        print("Usage: python zenodo_scraper.py <ZENODO_URL_OR_DOI> [--download]")
         return False
     
     url_or_doi = sys.argv[1]
+    download_option = "--download" in sys.argv
+    
     has_files, file_list = has_excel_csv_files(url_or_doi)
     
     print(has_files)
@@ -61,6 +90,14 @@ def main():
         print("Fichiers Excel/CSV trouvés:")
         for file in file_list:
             print(f"- {file}")
+        
+        # Télécharger les fichiers si demandé
+        if download_option:
+            zenodo_id = extract_zenodo_id(url_or_doi)
+            if zenodo_id:
+                print("\nTéléchargement des fichiers...")
+                downloaded = download_files(file_list, zenodo_id)
+                print(f"\n{len(downloaded)}/{len(file_list)} fichiers téléchargés avec succès.")
     else:
         print("Aucun fichier Excel/CSV trouvé")
     

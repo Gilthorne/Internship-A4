@@ -54,9 +54,12 @@ def has_excel_csv_files(github_url):
             if item["type"] == "blob":
                 path = item["path"]
                 if re.search(r'\.(xlsx?|csv)$', path, re.IGNORECASE):
+                    # Déterminer la branche principale (main ou master)
+                    branch = "main" if response.url.endswith("main?recursive=1") else "master"
                     excel_csv_files.append({
                         'path': path,
-                        'url': f"https://raw.githubusercontent.com/{username}/{repo}/main/{path}"
+                        'filename': os.path.basename(path),
+                        'url': f"https://raw.githubusercontent.com/{username}/{repo}/{branch}/{path}"
                     })
         
         return bool(excel_csv_files), excel_csv_files
@@ -65,63 +68,69 @@ def has_excel_csv_files(github_url):
         print(f"Erreur: {str(e)}")
         return False, []
 
-def download_files(file_list, directory="downloads"):
-    """Télécharge les fichiers Excel/CSV trouvés"""
+def download_files(file_list, repo_name):
+    """Télécharge les fichiers Excel/CSV trouvés dans un dossier nommé d'après le dépôt"""
+    # Créer un dossier nommé d'après le dépôt
+    directory = f"downloads/{repo_name}"
     os.makedirs(directory, exist_ok=True)
+    
     downloaded_files = []
     
     for file_info in file_list:
         try:
-            path = file_info['path']
             url = file_info['url']
+            filename = file_info['filename']
             
-            print(f"Téléchargement de {path}...")
-            
-            # Créer les sous-répertoires si nécessaire
-            filepath = os.path.join(directory, path)
-            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            # Gérer les doublons en ajoutant un suffixe numérique si nécessaire
+            filepath = os.path.join(directory, filename)
+            base, ext = os.path.splitext(filepath)
+            counter = 1
+            while os.path.exists(filepath):
+                filepath = f"{base}_{counter}{ext}"
+                counter += 1
             
             # Télécharger le fichier
             response = requests.get(url)
             if response.status_code != 200:
-                print(f"Erreur: HTTP {response.status_code}")
                 continue
             
             with open(filepath, 'wb') as f:
                 f.write(response.content)
             
-            print(f"Fichier téléchargé: {filepath}")
             downloaded_files.append(filepath)
             
-        except Exception as e:
-            print(f"Erreur lors du téléchargement de {file_info['path']}: {str(e)}")
+        except Exception:
+            continue
     
     return downloaded_files
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python github_scraper.py <GITHUB_REPO_URL> [--download]")
+        print("Usage: python github_scraper.py <GITHUB_REPO_URL>")
         return False
     
     github_url = sys.argv[1]
-    download_option = "--download" in sys.argv
     
+    # Extraire les informations du dépôt
+    username, repo = extract_repo_info(github_url)
+    if not username or not repo:
+        print(False)
+        return False
+    
+    repo_name = f"{username}_{repo}"
+    
+    # Vérifier la présence de fichiers Excel/CSV
     has_files, file_list = has_excel_csv_files(github_url)
     
+    # Afficher le résultat booléen
     print(has_files)
     
     if has_files:
-        print(f"{len(file_list)} fichier(s) Excel/CSV trouvé(s):")
-        for file in file_list:
-            print(f"- {file['path']}")
-        
-        # Télécharger les fichiers si demandé
-        if download_option:
-            print("\nTéléchargement des fichiers...")
-            downloaded = download_files(file_list)
-            print(f"\n{len(downloaded)}/{len(file_list)} fichiers téléchargés avec succès.")
+        # Télécharger automatiquement les fichiers dans un dossier unique
+        downloaded = download_files(file_list, repo_name)
+        print(f"{len(downloaded)}")
     else:
-        print("Aucun fichier Excel/CSV trouvé")
+        print("0")
     
     return has_files
 

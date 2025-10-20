@@ -1,180 +1,161 @@
 import pandas as pd
 import multiprocessing as mp
-from urllib.parse import urlparse
-import subprocess
+import os
 import re
+import subprocess
+from urllib.parse import urlparse
+import time
 
-# --- Étape 1: Filtrer par source ---
-def filtrer_source(lien: str):
-    """Garde seulement les liens des sources scientifiques"""
-    sources = ["github.com", "elsevier.com", "mendeley.com", "zenodo.org", "doi.org"]
-    return lien if any(src in lien.lower() for src in sources) else None
+def process_link(link):
+    """Traite un seul lien à travers toutes les étapes de la pipeline"""
+    # Initialiser les résultats
+    result = {
+        "lien": link,
+        "nom_article": extract_name(link),
+        "source_valide": False,
+        "contient_donnees": False,
+        "convenable": False
+    }
+    
+    # Étape 1: Vérifier la source
+    result["source_valide"] = verifier_source(link)
+    if not result["source_valide"]:
+        return result
+    
+    # Étape 2: Vérifier présence de données
+    result["contient_donnees"] = verifier_donnees(link)
+    if not result["contient_donnees"]:
+        return result
+    
+    # Étape 3: Si tout est bon, marquer comme convenable
+    result["convenable"] = True
+    
+    return result
 
-# --- Étape 2: Vérifier si le lien contient des données ---
-def verifier_donnees(lien: str):
-    """Vérifie si le lien contient des fichiers Excel/CSV"""
-    lien_lower = lien.lower()
-    
-    # GitHub
-    if "github.com" in lien_lower:
-        return verifier_scraper(lien, 'github_scraper.py')
-    
-    # Zenodo
-    elif "zenodo.org" in lien_lower:
-        return verifier_scraper(lien, 'zenodo_scraper.py')
-    
-    # Elsevier
-    elif "elsevier.com" in lien_lower or "doi.org" in lien_lower:
-        return verifier_elsevier(lien)
-    
-    # Mendeley
-    elif "mendeley.com" in lien_lower:
-        return verifier_scraper(lien, 'mendeley_scraper.py')
-    
-    return None
+def verifier_source(link):
+    """Vérifie si le lien provient d'une source valide (GitHub, Zenodo, Elsevier)"""
+    domain = urlparse(link).netloc.lower()
+    valid_sources = ['github.com', 'zenodo.org', 'elsevier.com', 'doi.org', 'sciencedirect.com']
+    return any(source in domain for source in valid_sources)
 
-def verifier_scraper(lien: str, scraper_name: str):
-    """Vérifie un lien avec un scraper donné"""
+def verifier_donnees(link):
+    """Vérifie si le lien contient des données Excel/CSV en appelant les scrapers appropriés"""
+    domain = urlparse(link).netloc.lower()
+    
+    # Sélectionner le scraper approprié en fonction du domaine
+    if 'github.com' in domain:
+        return appeler_scraper('github_scraper.py', link)
+    elif 'zenodo.org' in domain:
+        return appeler_scraper('zenodo_scraper.py', link)
+    elif any(d in domain for d in ['elsevier.com', 'doi.org', 'sciencedirect.com']):
+        return appeler_scraper('elsevier_scraper.py', link)
+    
+    return False
+
+def appeler_scraper(scraper, link):
+    """Appelle un scraper et vérifie s'il renvoie True ou False"""
     try:
+        # Utiliser le chemin relatif au répertoire courant
+        scraper_path = os.path.join(os.path.dirname(__file__), scraper)
+        if not os.path.exists(scraper_path):
+            scraper_path = scraper  # Utiliser juste le nom si le chemin n'existe pas
+        
+        # Exécuter le scraper
         result = subprocess.run(
-            ['python', f'd:/Internship A4/{scraper_name}', lien],
+            ['python', scraper_path, link],
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=120  # Timeout après 120 secondes
         )
         
-        # Chercher si des fichiers ont été trouvés
-        match = re.search(r'(\d+) fichier\(s\) Excel/CSV', result.stdout)
-        if match and int(match.group(1)) > 0:
-            return lien
-            
-    except:
-        pass
-    
-    return None
-
-def verifier_elsevier(lien: str):
-    """Vérifie un article Elsevier et extrait les liens vers dépôts"""
-    try:
-        result = subprocess.run(
-            ['python', 'd:/Internship A4/elsevier_scraper.py', lien],
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-        
-        # Chercher des fichiers Excel/CSV
-        file_match = re.search(r'(\d+) fichier\(s\) Excel/CSV trouvé\(s\)', result.stdout)
-        if file_match and int(file_match.group(1)) > 0:
-            return lien
-        
-        # Chercher des liens vers dépôts externes
-        if "lien(s) vers des dépôts:" in result.stdout:
-            # Extraire les liens
-            github_links = re.findall(r'https://github\.com/[\w\-\.]+/[\w\-\.]+', result.stdout)
-            zenodo_links = re.findall(r'https://zenodo\.org/records?/\d+', result.stdout)
-            mendeley_links = re.findall(r'https://data\.mendeley\.com/datasets/[\w\-/]+', result.stdout)
-            
-            all_links = github_links + zenodo_links + mendeley_links
-            
-            # Vérifier chaque lien trouvé avec le scraper approprié
-            for repo_link in all_links:
-                if 'github.com' in repo_link:
-                    if verifier_scraper(repo_link, 'github_scraper.py'):
-                        return lien
-                elif 'zenodo.org' in repo_link:
-                    if verifier_scraper(repo_link, 'zenodo_scraper.py'):
-                        return lien
-                elif 'mendeley.com' in repo_link:
-                    if verifier_scraper(repo_link, 'mendeley_scraper.py'):
-                        return lien
-        
+        # Vérifier si la première ligne du résultat est "True"
+        first_line = result.stdout.strip().split('\n')[0].lower()
+        return first_line == "true"
     except Exception as e:
-        print(f"Erreur lors de la vérification Elsevier: {e}")
-    
-    return None
+        print(f"Erreur lors de l'appel du scraper {scraper} pour {link}: {e}")
+        return False
 
-# --- Étape 3: Extraire le nom de l'article ---
-def extraire_nom(lien: str):
-    """Extrait un nom simple depuis le lien"""
-    parsed = urlparse(lien)
+def extract_name(link):
+    """Extrait un nom d'article simple à partir du lien"""
+    parsed = urlparse(link)
+    path = parsed.path
     
     # GitHub: user/repo
-    if "github.com" in lien:
-        parts = parsed.path.strip('/').split('/')
+    if 'github.com' in parsed.netloc:
+        parts = path.strip('/').split('/')
         if len(parts) >= 2:
             return f"{parts[0]}/{parts[1]}"
     
     # Zenodo: record ID
-    elif "zenodo.org" in lien:
-        match = re.search(r'/records?/(\d+)', lien)
+    elif 'zenodo.org' in parsed.netloc:
+        match = re.search(r'/records?/(\d+)', path)
         if match:
             return f"Zenodo-{match.group(1)}"
     
-    # Elsevier: DOI
-    elif "elsevier.com" in lien or "doi.org" in lien:
-        doi_match = re.search(r'10\.\d{4,}/[^\s]+', lien)
+    # Elsevier/DOI: dernier segment du DOI
+    elif 'doi.org' in parsed.netloc or 'elsevier.com' in parsed.netloc:
+        doi_match = re.search(r'10\.\d{4,}/[^\s/]+', link)
         if doi_match:
             return doi_match.group(0)
     
-    # Mendeley
-    elif "mendeley.com" in lien:
-        match = re.search(r'datasets/([^/\s]+)', lien)
-        if match:
-            return f"Mendeley-{match.group(1)}"
-    
-    # Par défaut
-    return parsed.path.strip('/').split('/')[-1] or parsed.netloc
+    # Par défaut, utiliser le dernier segment du chemin ou le domaine
+    parts = path.strip('/').split('/')
+    return parts[-1] if parts else parsed.netloc
 
-# --- Pipeline complète ---
-def traiter_lien(lien: str):
-    """Applique toutes les étapes de la pipeline"""
-    # Étape 1: Filtrer source
-    lien = filtrer_source(lien)
-    if not lien:
-        return None
+def run_pipeline(links, output_file='resultats.xlsx', max_workers=None):
+    """Exécute la pipeline en utilisant du multiprocessing"""
+    print(f"Traitement de {len(links)} liens...")
     
-    # Étape 2: Vérifier données
-    lien = verifier_donnees(lien)
-    if not lien:
-        return None
+    # Utiliser le nombre de cœurs disponibles par défaut
+    if max_workers is None:
+        max_workers = mp.cpu_count()
     
-    # Étape 3: Extraire nom
-    nom = extraire_nom(lien)
+    print(f"Utilisation de {max_workers} processeurs")
     
-    return {"nom_article": nom, "lien": lien}
+    # Utiliser un pool pour le multiprocessing
+    with mp.Pool(processes=max_workers) as pool:
+        results = pool.map(process_link, links)
+    
+    # Créer un DataFrame à partir des résultats
+    df = pd.DataFrame(results)
+    
+    # Sauvegarder dans un fichier Excel
+    df.to_excel(output_file, index=False)
+    print(f"Résultats sauvegardés dans {output_file}")
+    
+    # Afficher un résumé
+    n_total = len(df)
+    n_valid_source = df['source_valide'].sum()
+    n_has_data = df['contient_donnees'].sum()
+    n_suitable = df['convenable'].sum()
+    
+    print(f"\nRésumé:")
+    print(f"- Liens totaux: {n_total}")
+    print(f"- Sources valides: {n_valid_source}/{n_total}")
+    print(f"- Contenant des données: {n_has_data}/{n_total}")
+    print(f"- Convenables: {n_suitable}/{n_total}")
+    
+    return df
 
-# --- Exécution parallèle ---
-def run_pipeline(liens, workers=2):
-    """Traite une liste de liens en parallèle"""
-    print(f"Traitement de {len(liens)} liens avec {workers} workers...")
-    
-    with mp.Pool(processes=workers) as pool:
-        resultats = pool.map(traiter_lien, liens)
-    
-    # Filtrer les None
-    resultats = [r for r in resultats if r is not None]
-    
-    print(f"\nRésultats: {len(resultats)}/{len(liens)} liens validés")
-    
-    return pd.DataFrame(resultats)
-
-# --- Exemple d'utilisation ---
 if __name__ == "__main__":
-    liens = [
-        "https://github.com/gergelydinya/AviTrack",
-        "https://zenodo.org/record/17075237",
-        "https://doi.org/10.1016/j.ecoinf.2025.103419",
-        "https://example.com/fake-link",
-        "https://github.com/numpy/numpy",
-    ]
+    import sys
     
-    df = run_pipeline(liens, workers=5)
-    print("\n" + "="*60)
-    print("Base de données des articles avec données:")
-    print("="*60)
-    print(df)
+    # Lire les liens à partir d'un fichier s'il est fourni
+    if len(sys.argv) > 1:
+        input_file = sys.argv[1]
+        with open(input_file, 'r') as f:
+            links = [line.strip() for line in f if line.strip()]
+    else:
+        # Liste d'exemple de liens à tester
+        links = [
+            "https://github.com/xyluo25/exceltosqlserver",
+            "https://zenodo.org/records/17075237",
+            "   ",
+            "https://example.com/invalid-source",
+        ]
     
-    # Sauvegarder dans un CSV
-    df.to_csv("articles_avec_donnees.csv", index=False)
-    print("\nSauvegardé dans: articles_avec_donnees.csv")
+    # Nombre de processeurs à utiliser (si spécifié)
+    max_workers = int(sys.argv[2]) if len(sys.argv) > 2 else None
+    
+    # Exécuter la pipeline
+    df = run_pipeline(links, max_workers=max_workers)

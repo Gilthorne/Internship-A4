@@ -1,423 +1,312 @@
 import sys
-import os
 import re
+import json
 import requests
 import urllib.parse
-import urllib.request
-from urllib.parse import urlparse
-import subprocess
+import os
 
+# Configuration
 API_KEY = '5e0c4b89c3dc998fda16c52f50e7f4a2'
 
-def extract_doi(url_or_doi):
-    """Extrait le DOI depuis une URL ou DOI"""
-    # Si l'URL est de ScienceDirect, extraire le PII et le convertir en DOI
-    if 'sciencedirect.com' in url_or_doi:
-        pii_match = re.search(r'pii/([^/&#?]+)', url_or_doi)
-        if pii_match:
-            pii = pii_match.group(1)
-            try:
-                pii_url = f'https://api.elsevier.com/content/article/pii/{pii}'
-                headers = {'X-ELS-APIKey': API_KEY, 'Accept': 'application/json'}
-                response = requests.get(pii_url, headers=headers)
-                if response.status_code == 200:
-                    data = response.json()
-                    if 'full-text-retrieval-response' in data:
-                        doi = data['full-text-retrieval-response'].get('coredata', {}).get('prism:doi')
-                        if doi:
-                            return doi
-            except:
-                pass
-    
-    # Pattern standard pour DOI
+def extract_doi_from_url(url):
+    """Extrait un DOI d'une URL"""
     doi_pattern = r'10\.\d{4,}/[^\s?&#]+'
-    match = re.search(doi_pattern, url_or_doi)
+    match = re.search(doi_pattern, url)
     return match.group(0) if match else None
 
-def get_data_and_extract_files(doi):
-    """Récupère les données et extrait les fichiers"""
-    endpoints = {
-        'article': f'https://api.elsevier.com/content/article/doi/{urllib.parse.quote(doi)}',
-        'abstract': f'https://api.elsevier.com/content/abstract/doi/{urllib.parse.quote(doi)}',
-        'search': f'https://api.elsevier.com/content/search/scopus?query=DOI({urllib.parse.quote(doi)})'
-    }
+def get_elsevier_data(doi):
+    """Récupère les données d'un article Elsevier via API"""
+    # Construction de l'URL de l'API
+    api_url = f'https://api.elsevier.com/content/article/doi/{urllib.parse.quote(doi)}?view=FULL'
     
+    # Entêtes de la requête
     headers = {'X-ELS-APIKey': API_KEY, 'Accept': 'application/json'}
-    file_urls = []
-    external_repos = {'github': [], 'zenodo': [], 'mendeley': []}
     
-    # Interroger chaque endpoint et extraire les URLs de fichiers
-    for name, url in endpoints.items():
-        try:
-            response = requests.get(url, headers=headers)
-            if response.status_code != 200:
+    # Effectuer la requête
+    response = requests.get(api_url, headers=headers)
+    
+    if response.status_code != 200:
+        print(f"Erreur lors de l'accès à l'API: {response.status_code}")
+        return None
+    
+    return response.json()
+
+def find_excel_csv_files(data):
+    """Trouve les fichiers Excel/CSV dans les données de l'API"""
+    excel_csv_files = []
+    
+    # Vérifier si les données API sont disponibles
+    if not data or 'full-text-retrieval-response' not in data:
+        return excel_csv_files
+    
+    # Examiner les objets associés à l'article
+    full_text = data['full-text-retrieval-response']
+    if 'objects' in full_text and 'object' in full_text['objects']:
+        objects = full_text['objects']['object']
+        if not isinstance(objects, list):
+            objects = [objects]
+        
+        for obj in objects:
+            file_url = obj.get('$')
+            if not file_url:
                 continue
-                
-            with open(f"response_{name}.json", "w", encoding="utf-8") as f:
-                f.write(response.text)
             
-            content = response.text
-            download_links = re.findall(r'https?://[^\s"\'<>]+\.(?:xlsx?|csv)\b', content, re.IGNORECASE)
-            file_urls.extend(download_links)
+            ref = obj.get('@ref', '')
+            mimetype = obj.get('@mimetype', '').lower()
             
-            # Chercher les liens vers les dépôts externes
-            github_links = re.findall(r'https?://(?:www\.)?github\.com/[\w\-\.]+/[\w\-\.]+\b', content, re.IGNORECASE)
-            zenodo_links = re.findall(r'https?://(?:www\.)?zenodo\.org/records?/[\d]+\b', content, re.IGNORECASE)
-            mendeley_links = re.findall(r'https?://(?:www\.)?data\.mendeley\.com/datasets/[\w\d]+(/\d+)?\b', content, re.IGNORECASE)
+            # Vérifier si c'est un fichier Excel/CSV
+            is_excel = any(x in file_url.lower() or x in mimetype.lower() for x in ['.xlsx', '.xls', 'excel', 'spreadsheet'])
+            is_csv = any(x in file_url.lower() or x in mimetype.lower() for x in ['.csv', 'csv'])
             
-            # Chercher les DOIs de Mendeley (format 10.17632/...)
-            mendeley_dois = re.findall(r'10\.17632/[\w\d]+(/\d+)?', content)
-            for doi in mendeley_dois:
-                mendeley_links.append(f"https://doi.org/{doi}")
-            
-            # Nettoyer et ajouter les liens externes
-            for link_list, repo_type in [(github_links, 'github'), (zenodo_links, 'zenodo'), (mendeley_links, 'mendeley')]:
-                for link in link_list:
-                    link = re.sub(r'[.,;:]$', '', link)
-                    if link not in external_repos[repo_type]:
-                        external_repos[repo_type].append(link)
-            
-            # Chercher les mentions de référence à des données externes dans le texte
-            data_refs = re.findall(r'([^.]+\([^)]+, \d{4}\)[^.]*(?:data|repository|dataset|figshare|dryad|mendeley)[^.]*\.)', content, re.IGNORECASE)
-            for ref in data_refs:
-                doi_match = re.search(r'10\.\d{4,}/[a-zA-Z0-9./-]+', ref)
-                if doi_match:
-                    doi = doi_match.group(0)
-                    if '10.17632/' in doi:  # Mendeley Data DOI
-                        mendeley_url = f"https://doi.org/{doi}"
-                        if mendeley_url not in external_repos['mendeley']:
-                            external_repos['mendeley'].append(mendeley_url)
-            
-            # Extraire les objets si disponibles (uniquement pour article)
-            if name == 'article' and 'full-text-retrieval-response' in content:
-                try:
-                    data = response.json()
-                    if 'full-text-retrieval-response' in data:
-                        full_text = data['full-text-retrieval-response']
-                        if 'objects' in full_text and 'object' in full_text['objects']:
-                            objects = full_text['objects']['object']
-                            if not isinstance(objects, list):
-                                objects = [objects]
-                            
-                            for obj in objects:
-                                file_url = obj.get('$')
-                                if file_url and any(ext in file_url.lower() for ext in ['.xlsx', '.xls', '.csv']):
-                                    file_urls.append(file_url)
-                except:
-                    pass
-        except:
-            continue
+            if is_excel or is_csv:
+                file_type = 'Excel' if is_excel else 'CSV'
+                excel_csv_files.append({
+                    'type': file_type,
+                    'ref': ref,
+                    'url': file_url
+                })
     
-    # Obtenir le PII à partir du DOI
-    pii = None
-    try:
-        response = requests.get(endpoints['article'], headers=headers)
-        if response.status_code == 200:
-            data = response.json()
-            if 'full-text-retrieval-response' in data:
-                pii = data['full-text-retrieval-response'].get('coredata', {}).get('pii')
-    except:
-        pass
-    
-    if not pii:
-        pii_match = re.search(r'S\d{4}\d+', doi)
-        if pii_match:
-            pii = pii_match.group(0)
+    return excel_csv_files
 
-    # Scraper la page web HTML pour les liens supplémentaires
-    try:
-        if pii:
-            scidir_url = f"https://www.sciencedirect.com/science/article/pii/{pii}"
+def extract_data_availability_section(original_text):
+    """Extrait spécifiquement la section Data Availability du texte"""
+    # Liste des patterns pour trouver la section Data Availability
+    data_section_patterns = [
+        # Format commun avec titre et section qui suit
+        r'(?:Data availability|Availability of data|Data and code availability)(?:\s*|:\s*)(.*?)(?=(?:\n\s*\n\s*[A-Z][A-Za-z\s]+(?::|\.)\s*|\Z))',
+        # Format simple avec titre Data
+        r'(?:^|\n)(?:Data)(?:\s+|:\s*)(.*?)(?=(?:\n\s*\n\s*[A-Z][A-Za-z\s]+(?::|\.)\s*|\Z))',
+        # Format où Data availability est dans une section juste avant les references
+        r'(?:Data\s*Availability|Availability\s*of\s*Data)[^\n]*\n+(.*?)(?=\s*\n\s*References\s*\n)',
+        # Format générique qui cherche des paragraphes mentionnant les données
+        r'(?:The data used in this|All data are available|Data are available)([^.]+(?:\.[^.]+){0,10}?)(?=\s*\n\s*\n|\Z)',
+    ]
+    
+    # Recherche avec tous les patterns
+    for pattern in data_section_patterns:
+        matches = re.search(pattern, original_text, re.IGNORECASE | re.DOTALL)
+        if matches:
+            return matches.group(1).strip()
+    
+    return None
+
+def find_correct_bexis_url(text, data_availability_section=None):
+    """Trouve l'URL BExIS correcte en donnant la priorité aux formats spécifiques"""
+    # Rechercher d'abord dans la section Data Availability si disponible
+    if data_availability_section:
+        # Patterns BExIS spécifiques pour la section Data Availability
+        data_section_patterns = [
+            # Liens explicites
+            r'(https?://(?:www\.)?bexis\.uni-jena\.de/[^\s"\'<>)]+)',
+            # Descriptions avec URLs
+            r'(?:BExIS|Biodiversity Exploratories Information System)[^\n.]*?(https?://[^\s"\'<>)]+)',
+            # Autres formats de BExIS
+            r'(?:data (?:is|are) available (?:at|on|via)[^\n.]*?)(?:BExIS|Biodiversity Exploratories)[^\n.]*?(https?://[^\s"\'<>)]+)',
+        ]
+        
+        for pattern in data_section_patterns:
+            matches = re.findall(pattern, data_availability_section, re.IGNORECASE)
+            if matches:
+                # Nettoyer l'URL
+                bexis_url = matches[0].strip()
+                if isinstance(bexis_url, tuple):  # Si le pattern a des groupes multiples
+                    bexis_url = bexis_url[-1].strip()
+                return bexis_url.rstrip('.,:;')
+    
+    # Si rien n'est trouvé dans la section Data Availability, chercher dans le texte complet
+    # Liste des patterns BExIS par ordre de priorité
+    bexis_patterns = [
+        # Format spécifique avec dataset ID
+        r'https?://(?:www\.)?bexis\.uni-jena\.de/(?:ddm|data/ShowData)\.aspx\?DatasetId=\d+',
+        # Format avec path de données
+        r'https?://(?:www\.)?bexis\.uni-jena\.de/(?:PublicData|data/PublicData|ddm/Data)/[^\s\)"\'<>]+',
+        # Format avec chemin climatique spécifique
+        r'https?://(?:www\.)?bexis\.uni-jena\.de/[^\s\)"\'<>]*/(?:Climate|ClimateData)[^\s\)"\'<>]*',
+        # Formats généraux (dernier recours)
+        r'https?://(?:www\.)?bexis\.uni-jena\.de/[^\s\)"\'<>]+',
+    ]
+    
+    # Chercher chaque pattern
+    for pattern in bexis_patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        if matches:
+            # Nettoyer l'URL
+            bexis_url = matches[0].strip()
+            return bexis_url.rstrip('.,:;')
+    
+    # URL par défaut si aucun match spécifique n'est trouvé
+    return "https://www.bexis.uni-jena.de"
+
+def extract_mendeley_data_link(text, data_availability_section=None):
+    """Extrait le lien Mendeley Data correctement formaté"""
+    # Chercher d'abord dans la section Data Availability si disponible
+    if data_availability_section:
+        # Chercher un DOI Mendeley
+        doi_pattern = r'10\.17632/[\w\d./]+'
+        doi_match = re.search(doi_pattern, data_availability_section)
+        
+        if doi_match:
+            doi = doi_match.group(0)
+            return f"https://doi.org/{doi}"
+        
+        # Chercher une URL Mendeley directe
+        mendeley_pattern = r'https?://data\.mendeley\.com/datasets/[\w\d./]+'
+        mendeley_match = re.search(mendeley_pattern, data_availability_section)
+        
+        if mendeley_match:
+            return mendeley_match.group(0)
+    
+    # Si rien n'est trouvé dans la section Data Availability, chercher dans le texte complet
+    # Chercher un DOI Mendeley
+    doi_pattern = r'10\.17632/[\w\d./]+'
+    doi_match = re.search(doi_pattern, text)
+    
+    if doi_match:
+        doi = doi_match.group(0)
+        return f"https://doi.org/{doi}"
+    
+    # Chercher une URL Mendeley directe
+    mendeley_pattern = r'https?://data\.mendeley\.com/datasets/[\w\d./]+'
+    mendeley_match = re.search(mendeley_pattern, text)
+    
+    if mendeley_match:
+        return mendeley_match.group(0)
+    
+    return None
+
+def extract_data_repositories(data):
+    """Extrait les liens vers les dépôts de données (BExIS, Mendeley Data, etc.)"""
+    repo_links = []
+    
+    # Vérifier si les données API sont disponibles
+    if not data or 'full-text-retrieval-response' not in data:
+        return repo_links
+    
+    # Obtenir le texte complet
+    full_text = data['full-text-retrieval-response']
+    original_text = full_text.get('originalText', '')
+    
+    if not original_text:
+        return repo_links
+    
+    # 1. D'abord, extraire la section Data Availability
+    data_section = extract_data_availability_section(original_text)
+    
+    # Debug: afficher la section data availability
+    print("\n--- SECTION DATA AVAILABILITY ---")
+    print(data_section or "Section non trouvée")
+    print("--- FIN SECTION ---\n")
+    
+    # 2. Chercher BExIS - donner la priorité aux formats spécifiques
+    bexis_url = find_correct_bexis_url(original_text, data_section)
+    if bexis_url:
+        repo_links.append({
+            "type": "BExIS",
+            "url": bexis_url,
+            "context": "Data Repository"
+        })
+    
+    # 3. Chercher Mendeley Data
+    mendeley_url = extract_mendeley_data_link(original_text, data_section)
+    if mendeley_url:
+        repo_links.append({
+            "type": "Mendeley Data",
+            "url": mendeley_url,
+            "context": "Data Repository"
+        })
+    
+    # 4. Chercher Zenodo
+    zenodo_pattern = r'https?://(?:www\.)?zenodo\.org/records?/(\d+)'
+    zenodo_doi_pattern = r'10\.5281/zenodo\.(\d+)'
+    
+    # Chercher d'abord dans la section Data Availability
+    if data_section:
+        zenodo_match = re.search(zenodo_pattern, data_section)
+        if zenodo_match:
+            repo_links.append({
+                "type": "Zenodo",
+                "url": f"https://zenodo.org/record/{zenodo_match.group(1)}",
+                "context": "Data Repository"
+            })
         else:
-            scidir_url = f"https://doi.org/{doi}"
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml'
-        }
-        
-        response = requests.get(scidir_url, headers=headers)
-        if response.status_code == 200:
-            html_content = response.text
-            
-            # Chercher les mentions de dépôts Mendeley dans le texte HTML
-            mendeley_patterns = [
-                r'((?:data|code|dataset|repository).{1,50}?(?:Mendeley\s*Data|10\.17632).{1,100}?)(?:<\/p>|<\/div>)',
-                r'((?:Mendeley\s*Data|10\.17632).{1,100}?)(?:<\/p>|<\/div>)',
-                r'(published in the Mendeley Data Repository.{1,100}?)(?:<\/p>|<\/div>)'
-            ]
-            
-            for pattern in mendeley_patterns:
-                matches = re.findall(pattern, html_content, re.IGNORECASE | re.DOTALL)
-                for match in matches:
-                    mendeley_doi_match = re.search(r'10\.17632/[\w\d]+(?:/\d+)?', match)
-                    if mendeley_doi_match:
-                        mendeley_url = f"https://doi.org/{mendeley_doi_match.group(0)}"
-                        if mendeley_url not in external_repos['mendeley']:
-                            external_repos['mendeley'].append(mendeley_url)
-            
-            # Chercher les sections pertinentes avec des regex
-            data_sections = []
-            section_patterns = [
-                r'<section[^>]*>\s*<h\d[^>]*>Data availability</h\d>.*?</section>',
-                r'<section[^>]*>\s*<h\d[^>]*>Supplementary data</h\d>.*?</section>',
-                r'<section[^>]*>\s*<h\d[^>]*>Appendix [A-Z]</h\d>.*?</section>',
-                r'<div[^>]*class="[^"]*download[^"]*"[^>]*>.*?</div>',
-                r'<div[^>]*class="[^"]*extras[^"]*"[^>]*>.*?</div>'
-            ]
-            
-            for pattern in section_patterns:
-                sections = re.findall(pattern, html_content, re.DOTALL | re.IGNORECASE)
-                data_sections.extend(sections)
-            
-            # Extraire les liens des sections trouvées
-            for section in data_sections:
-                excel_links = re.findall(r'href="([^"]+\.(?:xlsx?|csv)[^"]*)"', section, re.IGNORECASE)
-                for href in excel_links:
-                    if href.startswith('/'):
-                        href = f"https://www.sciencedirect.com{href}"
-                    elif not href.startswith('http'):
-                        href = urllib.parse.urljoin(scidir_url, href)
-                    file_urls.append(href)
-                
-                # Chercher les liens des dépôts externes
-                github_links = re.findall(r'href="(https?://(?:www\.)?github\.com/[\w\-\.]+/[\w\-\.]+\b[^"]*)"', section, re.IGNORECASE)
-                zenodo_links = re.findall(r'href="(https?://(?:www\.)?zenodo\.org/records?/[\d]+\b[^"]*)"', section, re.IGNORECASE)
-                mendeley_links = re.findall(r'href="(https?://(?:(?:www\.)?data\.mendeley\.com/datasets/[\w\d]+(?:/\d+)?|doi\.org/10\.17632/[\w\d]+(?:/\d+)?)\b[^"]*)"', section, re.IGNORECASE)
-                
-                for link in github_links:
-                    link = re.sub(r'[.,;:]$', '', link)
-                    if link not in external_repos['github']:
-                        external_repos['github'].append(link)
-                
-                for link in zenodo_links:
-                    link = re.sub(r'[.,;:]$', '', link)
-                    if link not in external_repos['zenodo']:
-                        external_repos['zenodo'].append(link)
-                        
-                for link in mendeley_links:
-                    link = re.sub(r'[.,;:]$', '', link)
-                    if link not in external_repos['mendeley']:
-                        external_repos['mendeley'].append(link)
-            
-            # Sections spéciales
-            special_patterns = [
-                (r'<div[^>]*class="[^"]*download-all[^"]*"[^>]*>(.*?)</div>', r'href="([^"]+)"'),
-                (r'<table[^>]*class="[^"]*table[^"]*mmc[^"]*"[^>]*>(.*?)</table>', r'href="([^"]+)"'),
-                (r'Download\s+[^<>]*?<a[^>]*?href="([^"]+)"', None),
-                (r'Download all<[^>]*>.*?<a[^>]*href="([^"]+)"', None),
-                (r'Extras\s*\(\d+\)[^<]*<[^>]*>.*?<a[^>]*href="([^"]+)"', None)
-            ]
-            
-            for pattern, subpattern in special_patterns:
-                if subpattern:
-                    matches = re.search(pattern, html_content, re.DOTALL | re.IGNORECASE)
-                    if matches:
-                        section = matches.group(1)
-                        links = re.findall(subpattern, section)
-                        for href in links:
-                            if href.startswith('/'):
-                                href = f"https://www.sciencedirect.com{href}"
-                            elif not href.startswith('http'):
-                                href = urllib.parse.urljoin(scidir_url, href)
-                            file_urls.append(href)
-                else:
-                    links = re.findall(pattern, html_content, re.DOTALL | re.IGNORECASE)
-                    for href in links:
-                        if href.startswith('/'):
-                            href = f"https://www.sciencedirect.com{href}"
-                        elif not href.startswith('http'):
-                            href = urllib.parse.urljoin(scidir_url, href)
-                        file_urls.append(href)
-    except:
-        pass
+            zenodo_doi_match = re.search(zenodo_doi_pattern, data_section)
+            if zenodo_doi_match:
+                repo_links.append({
+                    "type": "Zenodo",
+                    "url": f"https://doi.org/10.5281/zenodo.{zenodo_doi_match.group(1)}",
+                    "context": "Data Repository"
+                })
     
-    # Filtrer les URLs pour ne garder que les xlsx, xls et csv
-    filtered_urls = []
-    for url in file_urls:
-        if re.search(r'\.(xlsx?|csv)(\?|$|\#)', url.lower()) or 'spreadsheet' in url.lower() or 'excel' in url.lower() or 'csv' in url.lower():
-            filtered_urls.append(url)
+    # Si rien n'est trouvé dans la section Data, chercher dans le texte complet
+    if not any(link["type"] == "Zenodo" for link in repo_links):
+        zenodo_match = re.search(zenodo_pattern, original_text)
+        if zenodo_match:
+            repo_links.append({
+                "type": "Zenodo",
+                "url": f"https://zenodo.org/record/{zenodo_match.group(1)}",
+                "context": "Data Repository"
+            })
+        else:
+            zenodo_doi_match = re.search(zenodo_doi_pattern, original_text)
+            if zenodo_doi_match:
+                repo_links.append({
+                    "type": "Zenodo",
+                    "url": f"https://doi.org/10.5281/zenodo.{zenodo_doi_match.group(1)}",
+                    "context": "Data Repository"
+                })
     
-    return list(set(filtered_urls)), external_repos
+    return repo_links
 
-def download_files(file_urls, directory="downloads"):
-    """Télécharge les fichiers"""
-    os.makedirs(directory, exist_ok=True)
-    downloaded_files = []
+def main(url_or_doi):
+    """Fonction principale pour analyser un article Elsevier"""
+    # Extraire le DOI si une URL est fournie
+    doi = extract_doi_from_url(url_or_doi) if 'http' in url_or_doi else url_or_doi
     
-    headers = {
-        'X-ELS-APIKey': API_KEY,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-        'Accept': '*/*'
+    if not doi:
+        print("Aucun DOI valide n'a été trouvé")
+        return False
+    
+    # Récupérer les données de l'API
+    data = get_elsevier_data(doi)
+    
+    if not data:
+        print("Impossible de récupérer les données de l'article")
+        return False
+    
+    # Rechercher les fichiers Excel/CSV
+    excel_csv_files = find_excel_csv_files(data)
+    
+    # Rechercher les liens vers des dépôts de données
+    repo_links = extract_data_repositories(data)
+    
+    # Vérifier si des fichiers ou dépôts ont été trouvés
+    has_data = len(excel_csv_files) > 0 or len(repo_links) > 0
+    
+    # Imprimer le résultat au format JSON
+    result = {
+        "doi": doi,
+        "excel_csv_files": excel_csv_files,
+        "repository_links": repo_links,
+        "has_data": has_data
     }
     
-    for url in file_urls:
-        try:
-            parsed_url = urlparse(url)
-            filename = os.path.basename(parsed_url.path)
-            
-            if not filename or '.' not in filename:
-                if 'xlsx' in url.lower():
-                    filename = f"file_{abs(hash(url)) % 10000}.xlsx"
-                elif 'xls' in url.lower():
-                    filename = f"file_{abs(hash(url)) % 10000}.xls"
-                elif 'csv' in url.lower():
-                    filename = f"file_{abs(hash(url)) % 10000}.csv"
-                else:
-                    filename = f"file_{abs(hash(url)) % 10000}.dat"
-            
-            filepath = os.path.join(directory, filename)
-            
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req) as response:
-                content = response.read()
-                
-                if content.startswith(b'<?xml') or content.startswith(b'<attachment-metadata'):
-                    continue
-                
-                with open(filepath, 'wb') as f:
-                    f.write(content)
-                
-                downloaded_files.append(filepath)
-        except:
-            pass
+    # Afficher le résultat booléen (pour le pipeline)
+    print(has_data)
     
-    return downloaded_files
-
-def process_external_repos(external_repos):
-    """Traite les liens externes GitHub, Zenodo et Mendeley trouvés dans les données Elsevier"""
-    downloaded_files = []
+    # Sauvegarder les résultats dans un fichier JSON
+    output_file = f"elsevier_result_{doi.replace('/', '_')}.json"
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(result, f, indent=2)
     
-    # Traiter les liens GitHub
-    for github_url in external_repos['github'][:1]:
-        try:
-            result = subprocess.run(
-                ['python', os.path.join(os.path.dirname(__file__), 'github_scraper.py'), github_url],
-                capture_output=True,
-                text=True,
-                timeout=120
-            )
-            if result.stdout.strip().split('\n')[0].lower() == 'true':
-                lines = result.stdout.strip().split('\n')
-                if len(lines) > 1:
-                    try:
-                        n_files = int(lines[1])
-                        downloaded_files.extend(['github_file'] * n_files)
-                    except ValueError:
-                        pass
-        except:
-            pass
+    print(f"Résultats sauvegardés dans {output_file}")
     
-    # Traiter les liens Zenodo
-    for zenodo_url in external_repos['zenodo'][:1]:
-        try:
-            result = subprocess.run(
-                ['python', os.path.join(os.path.dirname(__file__), 'zenodo_scraper.py'), zenodo_url],
-                capture_output=True,
-                text=True,
-                timeout=120
-            )
-            if result.stdout.strip().split('\n')[0].lower() == 'true':
-                lines = result.stdout.strip().split('\n')
-                if len(lines) > 1:
-                    try:
-                        n_files = int(lines[1])
-                        downloaded_files.extend(['zenodo_file'] * n_files)
-                    except ValueError:
-                        pass
-        except:
-            pass
-    
-    # Traiter les liens Mendeley Data
-    for mendeley_url in external_repos['mendeley'][:1]:
-        try:
-            # Pour Mendeley, télécharger les fichiers directement
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-            
-            # Si c'est un DOI, obtenir l'URL de redirection
-            if 'doi.org' in mendeley_url:
-                response = requests.head(mendeley_url, headers=headers, allow_redirects=True)
-                if response.status_code == 200:
-                    mendeley_url = response.url
-            
-            # Extraire l'ID du dataset
-            dataset_id = None
-            match = re.search(r'datasets/([\w\d]+)(?:/(\d+))?', mendeley_url)
-            if match:
-                dataset_id = match.group(1)
-                version = match.group(2) if match.group(2) else '1'
-                
-                # Construire l'URL de l'API Mendeley
-                api_url = f"https://data.mendeley.com/api/datasets/{dataset_id}/versions/{version}/files"
-                response = requests.get(api_url, headers=headers)
-                
-                if response.status_code == 200:
-                    files_data = response.json()
-                    files_to_download = []
-                    
-                    # Filtrer les fichiers Excel/CSV
-                    for file_info in files_data:
-                        filename = file_info.get('filename', '')
-                        if re.search(r'\.(xlsx?|csv)$', filename, re.IGNORECASE):
-                            files_to_download.append({
-                                'id': file_info.get('id'),
-                                'filename': filename
-                            })
-                    
-                    # Créer un dossier pour le dataset
-                    mendeley_dir = os.path.join("downloads", f"mendeley_{dataset_id}")
-                    os.makedirs(mendeley_dir, exist_ok=True)
-                    
-                    # Télécharger chaque fichier
-                    for file_info in files_to_download:
-                        file_url = f"https://data.mendeley.com/api/datasets/{dataset_id}/versions/{version}/files/{file_info['id']}/download"
-                        file_path = os.path.join(mendeley_dir, file_info['filename'])
-                        
-                        try:
-                            response = requests.get(file_url, headers=headers)
-                            if response.status_code == 200:
-                                with open(file_path, 'wb') as f:
-                                    f.write(response.content)
-                                downloaded_files.append(file_path)
-                        except:
-                            pass
-        except:
-            pass
-    
-    return downloaded_files
-
-def main():
-    if len(sys.argv) < 2:
-        print(False)
-        return False
-    
-    url_or_doi = sys.argv[1]
-    
-    # Extraire le DOI
-    doi = extract_doi(url_or_doi)
-    if not doi:
-        print(False)
-        return False
-    
-    # Récupérer les liens vers les fichiers and les dépôts externes
-    file_urls, external_repos = get_data_and_extract_files(doi)
-    
-    # Télécharger les fichiers directs d'Elsevier
-    downloaded_files = download_files(file_urls)
-    
-    # Traiter les dépôts externes (GitHub/Zenodo/Mendeley)
-    if external_repos['github'] or external_repos['zenodo'] or external_repos['mendeley']:
-        external_files = process_external_repos(external_repos)
-        downloaded_files.extend(external_files)
-    
-    # Déterminer si des fichiers ont été trouvés
-    has_files = bool(downloaded_files)
-    
-    # Afficher uniquement le résultat booléen et le nombre
-    print(has_files)
-    print(len(downloaded_files))
-    
-    return has_files
+    return has_data
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) < 2:
+        print("Usage: python elsevier_scraper.py <URL_OR_DOI>")
+        sys.exit(1)
+    
+    url_or_doi = sys.argv[1]
+    result = main(url_or_doi)
+    sys.exit(0 if result else 1)

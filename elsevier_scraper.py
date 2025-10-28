@@ -1,312 +1,362 @@
-import sys
-import re
 import json
 import requests
-import urllib.parse
 import os
+import PyPDF2
+import io
+from urllib.parse import urlparse
+import re
+import sys
 
-# Configuration
 API_KEY = '5e0c4b89c3dc998fda16c52f50e7f4a2'
-
-def extract_doi_from_url(url):
-    """Extrait un DOI d'une URL"""
-    doi_pattern = r'10\.\d{4,}/[^\s?&#]+'
-    match = re.search(doi_pattern, url)
-    return match.group(0) if match else None
+LLM_ENDPOINT = 'http://hivecore.famnit.upr.si:6666/api/chat'
 
 def get_elsevier_data(doi):
-    """Récupère les données d'un article Elsevier via API"""
-    # Construction de l'URL de l'API
-    api_url = f'https://api.elsevier.com/content/article/doi/{urllib.parse.quote(doi)}?view=FULL'
+    """Récupère les données depuis l'API Elsevier"""
+    api_url = f'https://api.elsevier.com/content/article/doi/{doi}?view=FULL'
     
-    # Entêtes de la requête
-    headers = {'X-ELS-APIKey': API_KEY, 'Accept': 'application/json'}
-    
-    # Effectuer la requête
-    response = requests.get(api_url, headers=headers)
-    
-    if response.status_code != 200:
-        print(f"Erreur lors de l'accès à l'API: {response.status_code}")
-        return None
-    
-    return response.json()
-
-def find_excel_csv_files(data):
-    """Trouve les fichiers Excel/CSV dans les données de l'API"""
-    excel_csv_files = []
-    
-    # Vérifier si les données API sont disponibles
-    if not data or 'full-text-retrieval-response' not in data:
-        return excel_csv_files
-    
-    # Examiner les objets associés à l'article
-    full_text = data['full-text-retrieval-response']
-    if 'objects' in full_text and 'object' in full_text['objects']:
-        objects = full_text['objects']['object']
-        if not isinstance(objects, list):
-            objects = [objects]
-        
-        for obj in objects:
-            file_url = obj.get('$')
-            if not file_url:
-                continue
-            
-            ref = obj.get('@ref', '')
-            mimetype = obj.get('@mimetype', '').lower()
-            
-            # Vérifier si c'est un fichier Excel/CSV
-            is_excel = any(x in file_url.lower() or x in mimetype.lower() for x in ['.xlsx', '.xls', 'excel', 'spreadsheet'])
-            is_csv = any(x in file_url.lower() or x in mimetype.lower() for x in ['.csv', 'csv'])
-            
-            if is_excel or is_csv:
-                file_type = 'Excel' if is_excel else 'CSV'
-                excel_csv_files.append({
-                    'type': file_type,
-                    'ref': ref,
-                    'url': file_url
-                })
-    
-    return excel_csv_files
-
-def extract_data_availability_section(original_text):
-    """Extrait spécifiquement la section Data Availability du texte"""
-    # Liste des patterns pour trouver la section Data Availability
-    data_section_patterns = [
-        # Format commun avec titre et section qui suit
-        r'(?:Data availability|Availability of data|Data and code availability)(?:\s*|:\s*)(.*?)(?=(?:\n\s*\n\s*[A-Z][A-Za-z\s]+(?::|\.)\s*|\Z))',
-        # Format simple avec titre Data
-        r'(?:^|\n)(?:Data)(?:\s+|:\s*)(.*?)(?=(?:\n\s*\n\s*[A-Z][A-Za-z\s]+(?::|\.)\s*|\Z))',
-        # Format où Data availability est dans une section juste avant les references
-        r'(?:Data\s*Availability|Availability\s*of\s*Data)[^\n]*\n+(.*?)(?=\s*\n\s*References\s*\n)',
-        # Format générique qui cherche des paragraphes mentionnant les données
-        r'(?:The data used in this|All data are available|Data are available)([^.]+(?:\.[^.]+){0,10}?)(?=\s*\n\s*\n|\Z)',
-    ]
-    
-    # Recherche avec tous les patterns
-    for pattern in data_section_patterns:
-        matches = re.search(pattern, original_text, re.IGNORECASE | re.DOTALL)
-        if matches:
-            return matches.group(1).strip()
-    
-    return None
-
-def find_correct_bexis_url(text, data_availability_section=None):
-    """Trouve l'URL BExIS correcte en donnant la priorité aux formats spécifiques"""
-    # Rechercher d'abord dans la section Data Availability si disponible
-    if data_availability_section:
-        # Patterns BExIS spécifiques pour la section Data Availability
-        data_section_patterns = [
-            # Liens explicites
-            r'(https?://(?:www\.)?bexis\.uni-jena\.de/[^\s"\'<>)]+)',
-            # Descriptions avec URLs
-            r'(?:BExIS|Biodiversity Exploratories Information System)[^\n.]*?(https?://[^\s"\'<>)]+)',
-            # Autres formats de BExIS
-            r'(?:data (?:is|are) available (?:at|on|via)[^\n.]*?)(?:BExIS|Biodiversity Exploratories)[^\n.]*?(https?://[^\s"\'<>)]+)',
-        ]
-        
-        for pattern in data_section_patterns:
-            matches = re.findall(pattern, data_availability_section, re.IGNORECASE)
-            if matches:
-                # Nettoyer l'URL
-                bexis_url = matches[0].strip()
-                if isinstance(bexis_url, tuple):  # Si le pattern a des groupes multiples
-                    bexis_url = bexis_url[-1].strip()
-                return bexis_url.rstrip('.,:;')
-    
-    # Si rien n'est trouvé dans la section Data Availability, chercher dans le texte complet
-    # Liste des patterns BExIS par ordre de priorité
-    bexis_patterns = [
-        # Format spécifique avec dataset ID
-        r'https?://(?:www\.)?bexis\.uni-jena\.de/(?:ddm|data/ShowData)\.aspx\?DatasetId=\d+',
-        # Format avec path de données
-        r'https?://(?:www\.)?bexis\.uni-jena\.de/(?:PublicData|data/PublicData|ddm/Data)/[^\s\)"\'<>]+',
-        # Format avec chemin climatique spécifique
-        r'https?://(?:www\.)?bexis\.uni-jena\.de/[^\s\)"\'<>]*/(?:Climate|ClimateData)[^\s\)"\'<>]*',
-        # Formats généraux (dernier recours)
-        r'https?://(?:www\.)?bexis\.uni-jena\.de/[^\s\)"\'<>]+',
-    ]
-    
-    # Chercher chaque pattern
-    for pattern in bexis_patterns:
-        matches = re.findall(pattern, text, re.IGNORECASE)
-        if matches:
-            # Nettoyer l'URL
-            bexis_url = matches[0].strip()
-            return bexis_url.rstrip('.,:;')
-    
-    # URL par défaut si aucun match spécifique n'est trouvé
-    return "https://www.bexis.uni-jena.de"
-
-def extract_mendeley_data_link(text, data_availability_section=None):
-    """Extrait le lien Mendeley Data correctement formaté"""
-    # Chercher d'abord dans la section Data Availability si disponible
-    if data_availability_section:
-        # Chercher un DOI Mendeley
-        doi_pattern = r'10\.17632/[\w\d./]+'
-        doi_match = re.search(doi_pattern, data_availability_section)
-        
-        if doi_match:
-            doi = doi_match.group(0)
-            return f"https://doi.org/{doi}"
-        
-        # Chercher une URL Mendeley directe
-        mendeley_pattern = r'https?://data\.mendeley\.com/datasets/[\w\d./]+'
-        mendeley_match = re.search(mendeley_pattern, data_availability_section)
-        
-        if mendeley_match:
-            return mendeley_match.group(0)
-    
-    # Si rien n'est trouvé dans la section Data Availability, chercher dans le texte complet
-    # Chercher un DOI Mendeley
-    doi_pattern = r'10\.17632/[\w\d./]+'
-    doi_match = re.search(doi_pattern, text)
-    
-    if doi_match:
-        doi = doi_match.group(0)
-        return f"https://doi.org/{doi}"
-    
-    # Chercher une URL Mendeley directe
-    mendeley_pattern = r'https?://data\.mendeley\.com/datasets/[\w\d./]+'
-    mendeley_match = re.search(mendeley_pattern, text)
-    
-    if mendeley_match:
-        return mendeley_match.group(0)
-    
-    return None
-
-def extract_data_repositories(data):
-    """Extrait les liens vers les dépôts de données (BExIS, Mendeley Data, etc.)"""
-    repo_links = []
-    
-    # Vérifier si les données API sont disponibles
-    if not data or 'full-text-retrieval-response' not in data:
-        return repo_links
-    
-    # Obtenir le texte complet
-    full_text = data['full-text-retrieval-response']
-    original_text = full_text.get('originalText', '')
-    
-    if not original_text:
-        return repo_links
-    
-    # 1. D'abord, extraire la section Data Availability
-    data_section = extract_data_availability_section(original_text)
-    
-    # Debug: afficher la section data availability
-    print("\n--- SECTION DATA AVAILABILITY ---")
-    print(data_section or "Section non trouvée")
-    print("--- FIN SECTION ---\n")
-    
-    # 2. Chercher BExIS - donner la priorité aux formats spécifiques
-    bexis_url = find_correct_bexis_url(original_text, data_section)
-    if bexis_url:
-        repo_links.append({
-            "type": "BExIS",
-            "url": bexis_url,
-            "context": "Data Repository"
-        })
-    
-    # 3. Chercher Mendeley Data
-    mendeley_url = extract_mendeley_data_link(original_text, data_section)
-    if mendeley_url:
-        repo_links.append({
-            "type": "Mendeley Data",
-            "url": mendeley_url,
-            "context": "Data Repository"
-        })
-    
-    # 4. Chercher Zenodo
-    zenodo_pattern = r'https?://(?:www\.)?zenodo\.org/records?/(\d+)'
-    zenodo_doi_pattern = r'10\.5281/zenodo\.(\d+)'
-    
-    # Chercher d'abord dans la section Data Availability
-    if data_section:
-        zenodo_match = re.search(zenodo_pattern, data_section)
-        if zenodo_match:
-            repo_links.append({
-                "type": "Zenodo",
-                "url": f"https://zenodo.org/record/{zenodo_match.group(1)}",
-                "context": "Data Repository"
-            })
-        else:
-            zenodo_doi_match = re.search(zenodo_doi_pattern, data_section)
-            if zenodo_doi_match:
-                repo_links.append({
-                    "type": "Zenodo",
-                    "url": f"https://doi.org/10.5281/zenodo.{zenodo_doi_match.group(1)}",
-                    "context": "Data Repository"
-                })
-    
-    # Si rien n'est trouvé dans la section Data, chercher dans le texte complet
-    if not any(link["type"] == "Zenodo" for link in repo_links):
-        zenodo_match = re.search(zenodo_pattern, original_text)
-        if zenodo_match:
-            repo_links.append({
-                "type": "Zenodo",
-                "url": f"https://zenodo.org/record/{zenodo_match.group(1)}",
-                "context": "Data Repository"
-            })
-        else:
-            zenodo_doi_match = re.search(zenodo_doi_pattern, original_text)
-            if zenodo_doi_match:
-                repo_links.append({
-                    "type": "Zenodo",
-                    "url": f"https://doi.org/10.5281/zenodo.{zenodo_doi_match.group(1)}",
-                    "context": "Data Repository"
-                })
-    
-    return repo_links
-
-def main(url_or_doi):
-    """Fonction principale pour analyser un article Elsevier"""
-    # Extraire le DOI si une URL est fournie
-    doi = extract_doi_from_url(url_or_doi) if 'http' in url_or_doi else url_or_doi
-    
-    if not doi:
-        print("Aucun DOI valide n'a été trouvé")
-        return False
-    
-    # Récupérer les données de l'API
-    data = get_elsevier_data(doi)
-    
-    if not data:
-        print("Impossible de récupérer les données de l'article")
-        return False
-    
-    # Rechercher les fichiers Excel/CSV
-    excel_csv_files = find_excel_csv_files(data)
-    
-    # Rechercher les liens vers des dépôts de données
-    repo_links = extract_data_repositories(data)
-    
-    # Vérifier si des fichiers ou dépôts ont été trouvés
-    has_data = len(excel_csv_files) > 0 or len(repo_links) > 0
-    
-    # Imprimer le résultat au format JSON
-    result = {
-        "doi": doi,
-        "excel_csv_files": excel_csv_files,
-        "repository_links": repo_links,
-        "has_data": has_data
+    headers = {
+        'X-ELS-APIKey': API_KEY,
+        'Accept': 'application/json'
     }
     
-    # Afficher le résultat booléen (pour le pipeline)
-    print(has_data)
+    try:
+        response = requests.get(api_url, headers=headers, timeout=30)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"✗ Erreur API: {response.status_code}")
+            return None
+    except Exception as e:
+        print(f"✗ Erreur lors de la récupération API: {e}")
+        return None
+
+def clean_filename(filename):
+    """Nettoie un nom de fichier pour le rendre valide"""
+    invalid_chars = '<>:"/\\|?*'
+    for char in invalid_chars:
+        filename = filename.replace(char, '_')
+    return filename[:100].strip()
+
+def get_article_title(api_data):
+    """Extrait le titre de l'article"""
+    try:
+        title = api_data['full-text-retrieval-response']['coredata']['dc:title']
+        return clean_filename(title)
+    except:
+        return "unknown_article"
+
+def download_file(url, filename, headers=None):
+    """Télécharge un fichier depuis une URL"""
+    try:
+        response = requests.get(url, headers=headers, stream=True, timeout=30)
+        
+        if response.status_code == 200:
+            with open(filename, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            
+            file_size = os.path.getsize(filename)
+            print(f"  ✓ {os.path.basename(filename)} ({file_size} bytes)")
+            return True
+        else:
+            print(f"  ✗ Échec {os.path.basename(filename)}: {response.status_code}")
+            return False
+    except Exception as e:
+        print(f"  ✗ Erreur {os.path.basename(filename)}: {e}")
+        return False
+
+def download_excel_csv_files(api_data, folder_name):
+    """Télécharge tous les fichiers Excel/CSV de l'article"""
+    downloaded_files = []
     
-    # Sauvegarder les résultats dans un fichier JSON
-    output_file = f"elsevier_result_{doi.replace('/', '_')}.json"
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(result, f, indent=2)
+    if not api_data or 'full-text-retrieval-response' not in api_data:
+        return downloaded_files
     
-    print(f"Résultats sauvegardés dans {output_file}")
+    objects = api_data['full-text-retrieval-response'].get('objects', {}).get('object', [])
+    if not isinstance(objects, list):
+        objects = [objects]
     
-    return has_data
+    os.makedirs(folder_name, exist_ok=True)
+    
+    for obj in objects:
+        ref = obj.get('@ref', 'unknown')
+        mimetype = obj.get('@mimetype', '')
+        url = obj.get('$', '')
+        
+        # Détecter Excel (XLSX moderne)
+        is_xlsx = (
+            mimetype == 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' or
+            mimetype == 'application/excel' or
+            ref.endswith('.xlsx')
+        )
+        
+        # Détecter CSV (y compris ceux mal étiquetés comme "application/vnd.ms-excel")
+        is_csv = (
+            mimetype == 'text/csv' or
+            mimetype == 'application/vnd.ms-excel' or
+            ref.endswith('.csv')
+        )
+        
+        if (is_xlsx or is_csv) and url:
+            # Déterminer le type et l'extension
+            if is_xlsx:
+                file_type = 'Excel'
+                extension = '.xlsx'
+            else:  # is_csv
+                file_type = 'CSV'
+                extension = '.csv'
+            
+            # Ajouter l'extension si elle n'est pas présente
+            if not ref.endswith(('.csv', '.xlsx', '.xls')):
+                filename = os.path.join(folder_name, f"{ref}{extension}")
+            else:
+                filename = os.path.join(folder_name, ref)
+                
+            headers = {'X-ELS-APIKey': API_KEY}
+            
+            if download_file(url, filename, headers):
+                downloaded_files.append({
+                    'ref': ref,
+                    'filename': filename,
+                    'type': file_type,
+                    'url': url,
+                    'size': obj.get('@size', 'unknown'),
+                    'mimetype': mimetype
+                })
+    
+    return downloaded_files
+
+def download_pdf(api_data, folder_name):
+    """Télécharge le PDF principal de l'article"""
+    if not api_data or 'full-text-retrieval-response' not in api_data:
+        return None
+    
+    objects = api_data['full-text-retrieval-response'].get('objects', {}).get('object', [])
+    if not isinstance(objects, list):
+        objects = [objects]
+    
+    os.makedirs(folder_name, exist_ok=True)
+    
+    # Chercher le PDF principal avec MIME type exact et référence "main"
+    for obj in objects:
+        ref = obj.get('@ref', '')
+        mimetype = obj.get('@mimetype', '')
+        url = obj.get('$', '')
+        
+        # Le PDF principal a le mimetype 'application/pdf' et ref contenant 'main'
+        if mimetype == 'application/pdf' and 'main' in ref.lower():
+            filename = os.path.join(folder_name, "main.pdf")
+            headers = {'X-ELS-APIKey': API_KEY}
+            
+            if download_file(url, filename, headers):
+                return filename
+    
+    # Si pas trouvé avec 'main', chercher n'importe quel PDF
+    for obj in objects:
+        mimetype = obj.get('@mimetype', '')
+        url = obj.get('$', '')
+        
+        if mimetype == 'application/pdf' and url:
+            filename = os.path.join(folder_name, "article.pdf")
+            headers = {'X-ELS-APIKey': API_KEY}
+            
+            if download_file(url, filename, headers):
+                return filename
+    
+    return None
+
+def extract_text_from_pdf(pdf_path):
+    """Extrait le texte du PDF"""
+    try:
+        with open(pdf_path, 'rb') as file:
+            pdf_reader = PyPDF2.PdfReader(file)
+            text = ""
+            
+            for page in pdf_reader.pages:
+                page_text = page.extract_text()
+                text += page_text + "\n"
+            
+            return text
+            
+    except Exception as e:
+        print(f"✗ Erreur lors de l'extraction du PDF: {e}")
+        return None
+
+def extract_data_availability_from_text(text):
+    """Extrait la section Data Availability du texte"""
+    if not text:
+        return None
+    
+    patterns = [
+        r'Data\s+availability\s+(.*?)(?=\s*(?:1\s+Introduction|Declaration\s+of\s+|CRediT\s+|Funding\s+|Acknowledgement|References|$))',
+        r'(This\s+work\s+is\s+partly\s+based\s+on\s+data.*?Repository[^.]*\.)',
+        r'Data\s+availability\s+(.*?)(?=\s*\n\s*\d+\s+[A-Z])',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+        if match:
+            section = match.group(1).strip()
+            if 50 <= len(section) <= 2000:
+                return section
+    
+    return None
+
+def query_llm_for_links(data_availability_text):
+    """Envoie la section Data Availability au LLM pour extraire les liens"""
+    system_instructions = """
+EXTRACT DATA AVAILABILITY LINKS FROM THE PROVIDED TEXT.
+You MUST return STRICT JSON format. Do not include any other text or markdown.
+The JSON structure must be:
+{
+  "links": [
+    {"text": "Description", "url": "URL_OR_DOI"}
+  ]
+}
+RULES:
+1. Only include actual data/resources links (e.g., datasets, code repositories).
+2. Use DOI URLs where available (format: https://doi.org/...).
+3. If no links are found, you MUST return {"links": []}.
+4. Extract BExIS, Mendeley Data, and other repository links.
+"""
+    
+    user_content = f"DATA AVAILABILITY SECTION:\n\n{data_availability_text}"
+    
+    request_payload = {
+        'model': 'hf.co/unsloth/Qwen3-4b-Instruct-2507-GGUF:UD-Q4_K_XL',
+        'options': {
+            'temperature': 0.7,
+            'top_p': 0.8,
+            'top_k': 20,
+            'min_p': 0.0,
+            'presence_penalty': 0.1
+        },
+        'stream': False,
+        'keep_alive': '5m',
+        'messages': [
+            {'role': 'system', 'content': system_instructions},
+            {'role': 'user', 'content': user_content}
+        ]
+    }
+    
+    try:
+        response = requests.post(
+            LLM_ENDPOINT,
+            json=request_payload,
+            headers={'Content-Type': 'application/json'},
+            timeout=60,
+            verify=False
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            
+            llm_output = None
+            if 'message' in result and 'content' in result['message']:
+                llm_output = result['message']['content']
+            elif 'response' in result:
+                llm_output = result['response']
+            
+            if llm_output:
+                try:
+                    parsed = json.loads(llm_output)
+                    return parsed.get('links', [])
+                except json.JSONDecodeError:
+                    return []
+        
+        return []
+            
+    except Exception as e:
+        print(f"✗ Erreur LLM: {e}")
+        return []
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python elsevier_scraper.py <DOI>")
+        return
+    
+    doi = sys.argv[1]
+    
+    print(f"🚀 ELSEVIER SCRAPER - DOI: {doi}")
+    
+    # 1. Récupérer les données de l'API
+    print("\n📊 Récupération des données API...")
+    api_data = get_elsevier_data(doi)
+    
+    if not api_data:
+        print("💥 Impossible de récupérer les données de l'API")
+        return
+    
+    # 2. Créer le dossier avec le titre de l'article
+    article_title = get_article_title(api_data)
+    folder_name = article_title
+    print(f"📁 Dossier: {folder_name}")
+    
+    # 3. Télécharger les fichiers Excel/CSV
+    print("\n📋 Téléchargement des fichiers Excel/CSV:")
+    downloaded_files = download_excel_csv_files(api_data, folder_name)
+    
+    if not downloaded_files:
+        print("  ⚠️ Aucun fichier Excel/CSV trouvé")
+    
+    # 4. Télécharger le PDF
+    print("\n📄 Téléchargement du PDF:")
+    pdf_path = download_pdf(api_data, folder_name)
+    
+    if not pdf_path:
+        print("  💥 PDF non trouvé")
+        return
+    
+    # 5. Extraire le texte du PDF
+    print("\n📖 Extraction du texte du PDF...")
+    pdf_text = extract_text_from_pdf(pdf_path)
+    
+    if not pdf_text:
+        print("💥 Impossible d'extraire le texte du PDF")
+        return
+    
+    # 6. Extraire la section Data Availability
+    print("🔍 Recherche de la section Data Availability...")
+    data_availability_text = extract_data_availability_from_text(pdf_text)
+    
+    if not data_availability_text:
+        print("⚠️ Section Data Availability non trouvée")
+        return
+    
+    print(f"✅ Section trouvée ({len(data_availability_text)} caractères)")
+    
+    # 7. Envoyer au LLM pour extraire les liens
+    print("\n🤖 Analyse LLM pour extraire les liens...")
+    llm_links = query_llm_for_links(data_availability_text)
+    
+    if llm_links:
+        print(f"✅ {len(llm_links)} liens extraits:")
+        for i, link in enumerate(llm_links, 1):
+            print(f"  {i}. {link.get('text', 'N/A')}")
+            print(f"     🔗 {link.get('url', 'N/A')}")
+    else:
+        print("⚠️ Aucun lien extrait par le LLM")
+    
+    # 8. Sauvegarder les résultats
+    results = {
+        'doi': doi,
+        'article_title': article_title,
+        'downloaded_files': downloaded_files,
+        'pdf_path': pdf_path,
+        'data_availability_section': data_availability_text,
+        'llm_extracted_links': llm_links,
+        'extraction_date': __import__('datetime').datetime.now().isoformat()
+    }
+    
+    results_file = os.path.join(folder_name, "scraper_results.json")
+    with open(results_file, 'w', encoding='utf-8') as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    
+    print(f"\n🎯 RÉSUMÉ:")
+    print(f"📊 Fichiers téléchargés: {len(downloaded_files)}")
+    print(f"🔗 Liens extraits: {len(llm_links)}")
+    print(f"💾 Résultats dans: {results_file}")
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python elsevier_scraper.py <URL_OR_DOI>")
-        sys.exit(1)
-    
-    url_or_doi = sys.argv[1]
-    result = main(url_or_doi)
-    sys.exit(0 if result else 1)
+    main()

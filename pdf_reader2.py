@@ -13,21 +13,25 @@ class DataAvailabilityExtractor:
         self.pii = pii
         self.doi = doi
         self.api_key = api_key or "5e0c4b89c3dc998fda16c52f50e7f4a2"
-        self.downloaded_pdf = None  # Changé de temp_pdf
+        self.downloaded_pdf = None
         self.article_title = None
+        self.downloads_dir = "downloads"
+        
+        # Créer le dossier downloads s'il n'existe pas
+        if not os.path.exists(self.downloads_dir):
+            os.makedirs(self.downloads_dir)
+            print(f"📁 Dossier créé: {os.path.abspath(self.downloads_dir)}")
     
     def get_pii_from_doi(self) -> bool:
         """Récupère le PII depuis un DOI."""
         if not self.doi:
             return False
         
-        # Nettoyer le DOI (enlever https://doi.org/ si présent)
         clean_doi = self.doi.replace('https://doi.org/', '').replace('http://doi.org/', '')
         
         print(f"\n🔍 Récupération du PII depuis le DOI...")
         print(f"   DOI: {clean_doi}")
         
-        # Essayer via l'API Elsevier
         url = f"https://api.elsevier.com/content/article/doi/{clean_doi}"
         
         headers = {
@@ -41,7 +45,6 @@ class DataAvailabilityExtractor:
             if response.status_code == 200:
                 data = response.json()
                 
-                # Extraire le PII depuis la réponse
                 pii = None
                 
                 if 'full-text-retrieval-response' in data:
@@ -72,16 +75,13 @@ class DataAvailabilityExtractor:
     
     def sanitize_filename(self, title: str) -> str:
         """Nettoie le titre pour en faire un nom de fichier valide."""
-        # Enlever les caractères invalides pour un nom de fichier
         invalid_chars = '<>:"/\\|?*'
         for char in invalid_chars:
             title = title.replace(char, '')
         
-        # Limiter la longueur
         if len(title) > 100:
             title = title[:100]
         
-        # Enlever les espaces multiples
         title = re.sub(r'\s+', ' ', title).strip()
         
         return title
@@ -112,13 +112,15 @@ class DataAvailabilityExtractor:
                 else:
                     filename = f"article_{self.pii}.pdf"
                 
-                self.downloaded_pdf = filename
+                # Sauvegarder dans le dossier downloads
+                filepath = os.path.join(self.downloads_dir, filename)
+                self.downloaded_pdf = filepath
                 
                 with open(self.downloaded_pdf, 'wb') as f:
                     f.write(response.content)
                 
                 self.pdf_path = self.downloaded_pdf
-                print(f"✅ Téléchargement réussi: {self.downloaded_pdf}")
+                print(f"✅ Téléchargement réussi: {filename}")
                 print(f"   Taille: {len(response.content):,} bytes")
                 print(f"💾 Fichier sauvegardé: {os.path.abspath(self.downloaded_pdf)}\n")
                 return True
@@ -137,7 +139,7 @@ class DataAvailabilityExtractor:
             print(f"⚠️  Impossible d'ouvrir le PDF: fichier introuvable")
             return
         
-        print(f"\n📂 Ouverture du PDF: {self.pdf_path}")
+        print(f"\n📂 Ouverture du PDF: {os.path.basename(self.pdf_path)}")
         
         try:
             system = platform.system()
@@ -158,13 +160,11 @@ class DataAvailabilityExtractor:
     def extract(self) -> Optional[Dict]:
         """Pipeline d'extraction complet."""
         try:
-            # Si DOI fourni, récupérer le PII d'abord
             if self.doi and not self.pii:
                 if not self.get_pii_from_doi():
                     print("❌ Impossible de récupérer le PII depuis le DOI")
                     return None
             
-            # Si PII fourni (ou récupéré), télécharger l'article
             if self.pii and not self.pdf_path:
                 if not self.download_from_elsevier():
                     return None
@@ -181,11 +181,9 @@ class DataAvailabilityExtractor:
                     return None
                 
                 references_section = self._extract_references(pdf_reader)
-                if not references_section:
-                    return {'page': data_section['page'], 'section_text': data_section['text'], 'links': []}
                 
-                print("\n🔍 Extraction des citations et liens...")
-                links = self._extract_links(data_section['text'], references_section)
+                print("\n🔍 Extraction des liens...")
+                links = self._extract_all_links(data_section['text'], references_section)
                 
                 return {
                     'page': data_section['page'],
@@ -237,16 +235,96 @@ class DataAvailabilityExtractor:
         
         return full_ref_text
     
-    def _extract_links(self, data_text: str, ref_text: str) -> List[Dict]:
-        """Extraction des liens."""
+    def _extract_all_links(self, data_text: str, ref_text: str) -> List[Dict]:
+        """
+        Extrait TOUS les liens du paragraphe Data Availability:
+        1. URLs directes dans le texte
+        2. Citations vers les références
+        """
         print("⚙️  Analyse du texte...\n")
         
+        all_links = []
+        
+        # Méthode 1: Extraire les URLs DIRECTES du paragraphe
+        direct_links = self._extract_direct_urls(data_text)
+        if direct_links:
+            print(f"🌐 URLs directes trouvées: {len(direct_links)}")
+            for link in direct_links:
+                print(f"   - {link['url']}")
+            all_links.extend(direct_links)
+            print()
+        
+        # Méthode 2: Extraire les liens depuis les CITATIONS
+        if ref_text:
+            citation_links = self._extract_citation_links(data_text, ref_text)
+            if citation_links:
+                print(f"📚 Liens depuis citations: {len(citation_links)}")
+                for link in citation_links:
+                    print(f"   - {link['citation']}: {link['url']}")
+                all_links.extend(citation_links)
+                print()
+        
+        # Supprimer les doublons
+        seen_urls = set()
+        unique_links = []
+        for link in all_links:
+            url = link['url']
+            if url not in seen_urls:
+                seen_urls.add(url)
+                unique_links.append(link)
+        
+        return unique_links
+    
+    def _extract_direct_urls(self, text: str) -> List[Dict]:
+        """Extrait les URLs directement présentes dans le texte."""
+        links = []
+        
+        # Pattern pour les URLs HTTP/HTTPS
+        url_pattern = r'https?://[^\s,\)\]<>\"\']+|www\.[^\s,\)\]<>\"\']+' 
+        urls = re.findall(url_pattern, text)
+        
+        for url in urls:
+            url_clean = url.rstrip('.,;:!?)')
+            if len(url_clean) > 10:
+                links.append({
+                    'url': url_clean,
+                    'type': 'direct_url',
+                    'source': 'Texte direct'
+                })
+        
+        # Pattern pour les DOIs
+        doi_patterns = [
+            r'doi\.org/([^\s,\)\]<>\"\']+)',
+            r'doi:?\s*([^\s,\)\]<>\"\']+)',
+            r'\b(10\.\d{4,}/[^\s,\)\]<>\"\']+)'
+        ]
+        
+        for doi_pattern in doi_patterns:
+            dois = re.findall(doi_pattern, text, re.IGNORECASE)
+            for doi in dois:
+                doi_clean = doi.rstrip('.,;:!?)')
+                if doi_clean.startswith('10.'):
+                    url = f"https://doi.org/{doi_clean}"
+                    if url not in [l['url'] for l in links]:
+                        links.append({
+                            'url': url,
+                            'type': 'doi',
+                            'source': 'DOI direct'
+                        })
+        
+        return links
+    
+    def _extract_citation_links(self, data_text: str, ref_text: str) -> List[Dict]:
+        """Extrait les liens depuis les citations (Auteur, Année)."""
         links = []
         
         # Pattern pour capturer les citations
         pattern = r'\(\s*([^\s,\)]+(?:\s+et\s+al\.)?)\s*,\s*(\d{4})\s*\)'
         matches = re.findall(pattern, data_text)
         citations = [(a.strip(), y.strip()) for a, y in matches if a and a[0].isupper()]
+        
+        if not citations:
+            return links
         
         print(f"📚 Citations détectées: {len(citations)}")
         for cit in citations:
@@ -295,8 +373,10 @@ class DataAvailabilityExtractor:
                 
                 if all_urls:
                     links.append({
-                        'citation': f"{author}, {year}",
                         'url': all_urls[0],
+                        'type': 'citation',
+                        'citation': f"{author}, {year}",
+                        'source': f"Citation: {author}, {year}",
                         'all_urls': all_urls
                     })
                     print(f"   Lien: {all_urls[0]}\n")
@@ -313,21 +393,26 @@ class DataAvailabilityExtractor:
         print("✅ RÉSULTATS FINAUX")
         print("=" * 80)
         
-        print(f"\n📄 Page: {result['page']}\n")
+        print(f"\n📄 Page: {result['page']}")
+        print(f"\n📝 Paragraphe Data Availability:")
+        print(f"{result['section_text']}\n")
+        print("-" * 80)
         
         if result['links']:
-            print(f"🔗 {len(result['links'])} LIEN(S) TROUVÉ(S):\n")
+            print(f"\n🔗 {len(result['links'])} LIEN(S) TROUVÉ(S):\n")
             
             for i, link in enumerate(result['links'], 1):
                 print(f"{i}. {link['url']}")
-                print(f"   Citation: {link['citation']}")
-                if len(link.get('all_urls', [])) > 1:
+                print(f"   Type: {link['type']}")
+                print(f"   Source: {link.get('source', 'N/A')}")
+                
+                if 'all_urls' in link and len(link['all_urls']) > 1:
                     print(f"   Autres URLs:")
                     for url in link['all_urls'][1:min(4, len(link['all_urls']))]:
                         print(f"      • {url}")
                 print()
         else:
-            print("⚠️  Aucun lien trouvé\n")
+            print("\n⚠️  Aucun lien trouvé\n")
         
         print("=" * 80)
 
@@ -366,7 +451,6 @@ Exemples:
     
     args = parser.parse_args()
     
-    # Vérifier qu'on a soit un PDF soit un DOI/PII
     if not args.pdf_file and not args.doi and not args.pii:
         parser.print_help()
         sys.exit(1)
@@ -383,15 +467,14 @@ Exemples:
     
     result = extractor.extract()
     
-    # Ouvrir le PDF si téléchargé (sauf si --no-open)
-#    if extractor.downloaded_pdf and not args.no_open:
-#        extractor.open_pdf()
+    if extractor.downloaded_pdf and not args.no_open:
+        extractor.open_pdf()
     
     extractor.display(result)
     
-    # Afficher un message de confirmation si un PDF a été téléchargé
     if extractor.downloaded_pdf:
         print(f"\n💾 Fichier PDF conservé: {os.path.abspath(extractor.downloaded_pdf)}")
+        print(f"📁 Dossier: {os.path.abspath(extractor.downloads_dir)}")
 
 
 if __name__ == "__main__":

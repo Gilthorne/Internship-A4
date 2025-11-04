@@ -5,9 +5,12 @@ import sys
 import os
 from concurrent.futures import ThreadPoolExecutor
 
+def eprint(*args, **kwargs):
+    """Print to stderr instead of stdout"""
+    print(*args, file=sys.stderr, **kwargs)
+
 def extract_zenodo_id(url_or_doi):
     """Extrait l'ID Zenodo depuis une URL ou DOI"""
-    # Patterns pour différents formats
     patterns = [
         r'zenodo\.org/records?/(\d+)',
         r'zenodo\.org/record/(\d+)',
@@ -29,12 +32,10 @@ def has_excel_csv_files(url_or_doi):
     if not zenodo_id:
         return False, []
     
-    # Configurer l'opener avec un User-Agent pour éviter les blocages
     opener = urllib.request.build_opener()
     opener.addheaders = [('User-Agent', 'Mozilla/5.0')]
     urllib.request.install_opener(opener)
     
-    # Essayer les deux formats d'URL
     urls = [
         f"https://zenodo.org/records/{zenodo_id}",
         f"https://zenodo.org/record/{zenodo_id}"
@@ -52,25 +53,20 @@ def has_excel_csv_files(url_or_doi):
     if not html_content:
         return False, []
     
-    # Utiliser une expression régulière plus robuste pour trouver les fichiers
     file_list = []
     
-    # Chercher dans les tables de fichiers
     table_rows = re.findall(r'<tr[^>]*>.*?<td[^>]*>(.*?)</td>.*?</tr>', html_content, re.DOTALL)
     for row in table_rows:
         file_match = re.search(r'>([^<>]+\.(?:xlsx?|csv))<', row, re.IGNORECASE)
         if file_match:
             file_list.append(file_match.group(1))
     
-    # Chercher dans les liens
     href_matches = re.findall(r'href=["\'](?:/records?/\d+/files/|/api/records/\d+/files/)([^"\'>\s]+\.(?:xlsx?|csv))(?:\?[^"\']*)?["\']', html_content, re.IGNORECASE)
     file_list.extend(href_matches)
     
-    # Chercher dans le texte
     text_matches = re.findall(r'>([^<>]+\.(?:xlsx?|csv))<', html_content, re.IGNORECASE)
     file_list.extend(text_matches)
     
-    # Nettoyer et dédupliquer
     cleaned_files = []
     for file in file_list:
         cleaned = file.replace('&amp;', '&').replace('%20', ' ')
@@ -80,11 +76,10 @@ def has_excel_csv_files(url_or_doi):
     return bool(cleaned_files), cleaned_files
 
 def download_file(args):
-    """Télécharge un seul fichier - pour le multithreading"""
+    """Télécharge un seul fichier"""
     filename, base_urls, directory = args
     os.makedirs(directory, exist_ok=True)
     
-    # Créer un opener avec User-Agent
     opener = urllib.request.build_opener()
     opener.addheaders = [('User-Agent', 'Mozilla/5.0')]
     urllib.request.install_opener(opener)
@@ -102,7 +97,7 @@ def download_file(args):
     
     return None
 
-def download_files(file_list, zenodo_id, directory="downloads"):
+def download_files(file_list, zenodo_id, directory):
     """Télécharge les fichiers Excel/CSV trouvés en parallèle"""
     if not file_list:
         return []
@@ -112,35 +107,42 @@ def download_files(file_list, zenodo_id, directory="downloads"):
         f"https://zenodo.org/record/{zenodo_id}/files/"
     ]
     
-    # Utiliser du multithreading pour accélérer les téléchargements
     args_list = [(filename, base_urls, directory) for filename in file_list]
     downloaded_files = []
     
     with ThreadPoolExecutor(max_workers=5) as executor:
-        for i, result in enumerate(executor.map(download_file, args_list), 1):
+        for result in executor.map(download_file, args_list):
             if result:
                 downloaded_files.append(result)    
     return downloaded_files
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python zenodo_scraper.py <ZENODO_URL_OR_DOI>")
-        return False
+    import argparse
     
-    url_or_doi = sys.argv[1]
+    parser = argparse.ArgumentParser()
+    parser.add_argument('url', help='Zenodo URL or DOI')
+    parser.add_argument('--output-dir', default=None, help='Output directory')
+    
+    args = parser.parse_args()
+    url_or_doi = args.url
+    
     has_files, file_list = has_excel_csv_files(url_or_doi)
     
-    # Afficher le résultat booléen
-    print(has_files)
-    
     if has_files:
-        print(f"{len(file_list)} fichier(s) Excel/CSV trouvé(s)")
         zenodo_id = extract_zenodo_id(url_or_doi)
         if zenodo_id:
-            downloaded = download_files(file_list, zenodo_id)
-            print(f"Téléchargement terminé: {len(downloaded)}/{len(file_list)} fichiers")
-    else:
-        print("Aucun fichier Excel/CSV trouvé")
+            # Déterminer le dossier de sortie
+            if args.output_dir:
+                output_dir = os.path.join(args.output_dir, f"zenodo_{zenodo_id}")
+            else:
+                output_dir = f"downloads/zenodo_{zenodo_id}"
+            
+            downloaded = download_files(file_list, zenodo_id, output_dir)
+            eprint(f"Downloaded {len(downloaded)}/{len(file_list)} files to {output_dir}")
+    
+    # Output format for pipeline
+    print("True" if has_files else "False")
+    print(len(file_list) if has_files else "0")
     
     return has_files
 

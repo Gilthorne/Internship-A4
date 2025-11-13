@@ -1,0 +1,12 @@
+CREATE TABLE IF NOT EXISTS CLASSIFICATION (
+    id SERIAL PRIMARY KEY,
+    title VARCHAR(255) NOT NULL,
+    DOI VARCHAR(255) NOT NULL,
+    DONE BOOLEAN DEFAULT FALSE
+);
+
+
+INSERT INTO CLASSIFICATION (title, DOI, DONE) VALUES
+('Study on Machine Learning', '10.1000/ml.2021.001', FALSE),
+('Advances in Quantum Computing', '10.1000/qc.2021.002', TRUE),
+('Exploring Deep Space', '10.1000/ds.2021.003', FALSE);

@@ -19,9 +19,5 @@ for entry in json_decode:
     cursor.execute(sql_insert, (title, doi, False))
     
     
-sql_show = "SELECT * FROM CLASSIFICATION"
-cursor.execute(sql_show)
-results = cursor.fetchall()
-for row in results:
-    print(row)
+
 database_connection.commit()

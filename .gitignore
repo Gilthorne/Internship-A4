@@ -13,3 +13,5 @@
 /*.txt
 /__pycache__/*
 /*.pdf
+/Old_folder/*
+/*.env

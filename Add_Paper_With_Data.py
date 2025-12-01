@@ -24,42 +24,44 @@ cursor = db_connect.cursor()
 
 def extract_data_files(content_text: str):
     """
-    Extrait:
-      - fichiers CSV / Excel
-      - liens GitHub / Zenodo / Mendeley / Elsevier
-    (les ZIP ne sont pas retournés dans la liste finale)
+    Extracts:
+      - CSV / Excel files
+      - GitHub / Zenodo / Mendeley / Elsevier links
+    (ZIP files are NOT returned in the final list)
     Returns: (count, list_of_files)
     """
-    # Ce qu'on garde en sortie
+    # What we keep in output
     patterns_keep = [
         r'\b\w+\.csv\b',                      # .csv files
         r'\b\w+\.xlsx?\b',                    # .xls or .xlsx files
+        r'https?://(?:dx\.)?doi\.org/10\.\d{4,9}/zenodo\.\d+\b',
+        r'https?://data.mendeley.com/datasets/[^\s"]+',
         r'https?://github\.com/[^\s"]+',      # GitHub links
         r'https?://zenodo\.org/[^\s"]+',      # Zenodo
         r'https?://data\.mendeley\.com/[^\s"]+',
         r'https?://(?:www\.)?elsevier\.com/[^\s"]+',
     ]
 
-    # On détecte aussi les .zip pour filtrer éventuellement plus tard si tu veux,
-    # mais on NE les retourne PAS dans files_list
+    # We also detect .zip files for potential filtering later,
+    # but we do NOT return them in files_list
     pattern_zip = r'https?://[^\s"]+\.zip\b'
 
     files_found = []
 
-    # 1) fichiers / liens à garder
+    # 1) files / links to keep
     for pattern in patterns_keep:
         matches = re.findall(pattern, content_text, re.IGNORECASE)
         files_found.extend(matches)
 
-    # 2) détection éventuelle de zip (si tu veux les exploiter plus tard)
+    # 2) potential detection of zip files
     zip_urls = re.findall(pattern_zip, content_text, re.IGNORECASE)
-    # pour l'instant: on ne fait rien avec zip_urls, et surtout on
-    # ne les ajoute pas à files_found
+    # for now: we do nothing with zip_urls, and especially we
+    # do not add them to files_found
 
-    # normalisation simple pour URLs avec '.' à la fin
+    # simple normalization for URLs with '.' at the end
     normalized = [x.rstrip('.') for x in files_found]
 
-    # Remove duplicates en gardant l'ordre
+    # Remove duplicates while preserving order
     seen = set()
     unique = []
     for x in normalized:

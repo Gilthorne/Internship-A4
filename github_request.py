@@ -21,7 +21,7 @@ def find_csv_excel_in_repo(repo_name):
     """
     # Extensions to search for
     extensions = ('.csv', '.xlsx', '.xls')
-    all_files = {}  # Dictionary: {file_path: [list of branches]}
+    all_files = []
     
     try:
         # 1. Get all branches
@@ -42,7 +42,7 @@ def find_csv_excel_in_repo(repo_name):
             tree_response = requests.get(tree_url)
             
             if tree_response.status_code != 200:
-                print(f"  ⚠️  Unable to access this branch")
+                print(f"Unable to access this branch")
                 continue
             
             tree_data = tree_response.json()
@@ -53,26 +53,17 @@ def find_csv_excel_in_repo(repo_name):
                 if item['type'] == 'blob':
                     file_path = item['path']
                     if file_path.lower().endswith(extensions):
-                        if file_path not in all_files:
-                            all_files[file_path] = []
-                        all_files[file_path].append(branch_name)
+                        file_url = f"https://github.com/{repo_name}/blob/{branch_name}/{file_path}"
+                        all_files.append({
+                            'url': file_url,
+                            'path': file_path,
+                            'branch': branch_name
+                        })
                         branch_file_count += 1
             
-            print(f"  ✓ {branch_file_count} file(s) found\n")
+            print(f"{branch_file_count} file(s) found\n")
         
-        # 4. Generate URLs
-        results = []
-        for file_path, branches_list in all_files.items():
-            # Use the first branch where the file appears
-            first_branch = branches_list[0]
-            file_url = f"https://github.com/{repo_name}/blob/{first_branch}/{file_path}"
-            results.append({
-                'url': file_url,
-                'path': file_path,
-                'branches': branches_list
-            })
-        
-        return results
+        return all_files
         
     except requests.exceptions.HTTPError as e:
         print(f"HTTP Error: {e}")
@@ -84,7 +75,8 @@ def find_csv_excel_in_repo(repo_name):
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
-        print("  python find_spreadsheets_simple.py https://github.com/fivethirtyeight/data")
+        print("Usage: python find_spreadsheets_simple.py <github_url_or_repo>")
+        print("Example: python find_spreadsheets_simple.py https://github.com/fivethirtyeight/data")
         sys.exit(1)
     
     input_value = sys.argv[1]
@@ -102,11 +94,9 @@ if __name__ == '__main__':
     
     print(f"\n{'='*60}")
     if files:
-        print(f"✓ {len(files)} unique file(s) found:\n")
+        print(f"Total: {len(files)} file(s) found:\n")
         for file_info in files:
-            print(f"  • {file_info['url']}")
-            if len(file_info['branches']) > 1:
-                print(f"    (Also present in: {', '.join(file_info['branches'][1:])})")
+            print(f"  {file_info['path']} (branch: {file_info['branch']})")
     else:
         print("No CSV or Excel files found.")
     print('='*60)

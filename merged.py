@@ -7,6 +7,7 @@ import time
 from dotenv import load_dotenv
 import requests
 import mysql.connector as sql
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 load_dotenv()
 API_KEY = os.getenv('ELSEVIER_API_KEY')
@@ -41,10 +42,115 @@ def fetch_elsevier(session: requests.Session, doi: str):
     url = f'https://api.elsevier.com/content/article/doi/{urllib.parse.quote(doi)}'
     headers = {'X-ELS-APIKey': API_KEY, 'Accept': 'application/json'}
     try:
-        r = session.get(url, headers=headers)
+        r = session.get(url, headers=headers, timeout=20)
         return r.content.decode('utf-8', errors='ignore')
     except Exception:
         return ""
+
+
+def get_db_connection():
+    return sql.connect(
+        user=str(os.getenv('DB_USER')),
+        password=str(os.getenv('DB_PASSWORD')),
+        host=str(os.getenv('DB_HOST')),
+        database=str(os.getenv('DB_NAME')),
+        autocommit=False,
+    )
+
+
+def process_paper(entry, worker_id: int):
+    """
+    Multithreaded unit of work.
+
+    Behavior matches original single-threaded logic:
+    - If no data files found in Elsevier content -> do NOT insert into CLASSIFICATION.
+    - If data files found -> ensure a CLASSIFICATION row exists (DONE=1) and insert EXTRACTION rows.
+    """
+    doi = entry.get('doi')
+    if not doi:
+        return
+
+    title = entry.get('title', '')
+    url = entry.get('url', '')
+
+    paper_start = time.time()
+
+    # Each task gets its own DB connection and HTTP session
+    try:
+        db = get_db_connection()
+    except Exception as e:
+        print(f"worker {worker_id}: db connect error: {e}", file=sys.stderr)
+        return
+
+    cur = db.cursor()
+    session = requests.Session()
+
+    insert_class_sql = "INSERT INTO CLASSIFICATION (title, DOI, DONE) VALUES (%s, %s, %s)"
+    select_id_sql = "SELECT id FROM CLASSIFICATION WHERE DOI = %s"
+    update_done_sql = "UPDATE CLASSIFICATION SET DONE = 1 WHERE id = %s"
+    insert_extr_sql = "INSERT INTO EXTRACTION (pid, URL, data_link, done) VALUES (%s, %s, %s, %s)"
+
+    try:
+        # 1) Fetch Elsevier content
+        content = fetch_elsevier(session, doi)
+        if not content:
+            elapsed = time.time() - paper_start
+            print(f"worker {worker_id}: timing {elapsed:.3f}s for doi {doi} (no content)")
+            return
+
+        files = extract_data_files(content)
+        if not files:
+            # Match original behavior: do NOT insert into CLASSIFICATION if no data
+            elapsed = time.time() - paper_start
+            print(f"worker {worker_id}: timing {elapsed:.3f}s for doi {doi} (no files)")
+            return
+
+        # 2) Ensure CLASSIFICATION row exists (only for papers with data)
+        pid = None
+        try:
+            cur.execute(insert_class_sql, (title, doi, 1))
+            pid = cur.lastrowid
+            db.commit()
+        except Exception:
+            # Likely duplicate DOI – row already exists
+            db.rollback()
+            try:
+                cur.execute(select_id_sql, (doi,))
+                row = cur.fetchone()
+                pid = row[0] if row else None
+            except Exception as e:
+                print(f"worker {worker_id}: select_id_sql error for doi {doi}: {e}", file=sys.stderr)
+                pid = None
+
+            if pid is not None:
+                # Make sure DONE is set to 1 (idempotent)
+                try:
+                    cur.execute(update_done_sql, (pid,))
+                    db.commit()
+                except Exception:
+                    db.rollback()
+
+        if pid is None:
+            # Could not get or create CLASSIFICATION row, give up on this DOI
+            elapsed = time.time() - paper_start
+            print(f"worker {worker_id}: timing {elapsed:.3f}s for doi {doi} (no pid)")
+            return
+
+        # 3) Insert EXTRACTION rows (pid, URL, data_link, done=0)
+        ex_rows = [(pid, url, link, 0) for link in files]
+        try:
+            cur.executemany(insert_extr_sql, ex_rows)
+            db.commit()
+        except Exception as e:
+            print(f"worker {worker_id}: insert_extr_sql error for doi {doi}: {e}", file=sys.stderr)
+            db.rollback()
+
+        elapsed = time.time() - paper_start
+        print(f"worker {worker_id}: timing {elapsed:.3f}s for doi {doi}")
+
+    finally:
+        cur.close()
+        db.close()
 
 
 def main():
@@ -55,130 +161,27 @@ def main():
         print(f"error: cannot read {JSON_PATH}: {e}", file=sys.stderr)
         return
 
-    doi_to_url = {e.get('doi'): e.get('url', '') for e in links if e.get('doi')}
+    # Only papers with a DOI are candidates
+    entries = [e for e in links if e.get('doi')]
 
-    try:
-        db = sql.connect(
-            user=str(os.getenv('DB_USER')),
-            password=str(os.getenv('DB_PASSWORD')),
-            host=str(os.getenv('DB_HOST')),
-            database=str(os.getenv('DB_NAME')),
-            autocommit=False,
-        )
-    except Exception as e:
-        print(f"error: db connect: {e}", file=sys.stderr)
-        return
+    num_workers = 4
 
-    cur = db.cursor()
-    session = requests.Session()
+    start_time = time.time()
 
-    processed = set()
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = []
+        for idx, entry in enumerate(entries):
+            worker_id = idx % num_workers  # just for log labeling
+            futures.append(executor.submit(process_paper, entry, worker_id))
 
-    # Phase 1: process JSON entries (fetch once, insert CLASSIFICATION and EXTRACTION, mark DONE)
-    insert_class_sql = "INSERT INTO CLASSIFICATION (title, DOI, DONE) VALUES (%s, %s, %s)"
-    select_id_sql = "SELECT id FROM CLASSIFICATION WHERE DOI = %s"
-    update_done_sql = "UPDATE CLASSIFICATION SET DONE = 1 WHERE id = %s"
-    insert_extr_sql = "INSERT INTO EXTRACTION (pid, URL, data_link, done) VALUES (%s, %s, %s, %s)"
-
-    for e in links:
-        doi = e.get('doi')
-        if not doi:
-            continue
-        if doi in processed:
-            continue
-
-        paper_start = time.time()
-
-        content = fetch_elsevier(session, doi)
-        if not content:
-            processed.add(doi)
-            elapsed = time.time() - paper_start
-            print(f"timing: {elapsed:.3f}s for doi {doi}")
-            continue
-        files = extract_data_files(content)
-        if not files:
-            processed.add(doi)
-            elapsed = time.time() - paper_start
-            print(f"timing: {elapsed:.3f}s for doi {doi}")
-            continue
-
-        title = e.get('title', '')
-        url = e.get('url', '')
-
-        pid = None
-        try:
-            cur.execute(insert_class_sql, (title, doi, 1))
-            pid = cur.lastrowid
-            db.commit()
-        except Exception:
-            db.rollback()
+        for f in as_completed(futures):
             try:
-                cur.execute(select_id_sql, (doi,))
-                row = cur.fetchone()
-                pid = row[0] if row else None
-                if pid:
-                    try:
-                        cur.execute(update_done_sql, (pid,))
-                        db.commit()
-                    except Exception:
-                        db.rollback()
-            except Exception:
-                pid = None
+                f.result()
+            except Exception as e:
+                print(f"error in worker: {e}", file=sys.stderr)
 
-        if pid:
-            rows = [(pid, url, link, 0) for link in files]
-            try:
-                cur.executemany(insert_extr_sql, rows)
-                db.commit()
-            except Exception:
-                db.rollback()
-
-        processed.add(doi)
-        elapsed = time.time() - paper_start
-        print(f"timing: {elapsed:.3f}s for doi {doi}")
-
-    # Phase 2: process remaining CLASSIFICATION WHERE DONE = 0
-    try:
-        cur.execute("SELECT id, DOI FROM CLASSIFICATION WHERE DONE = 0")
-        rows = cur.fetchall()
-    except Exception as e:
-        print(f"error: select CLASSIFICATION: {e}", file=sys.stderr)
-        cur.close()
-        db.close()
-        return
-
-    for row in rows:
-        pid, doi = row[0], row[1]
-        if doi in processed:
-            continue
-
-        paper_start = time.time()
-
-        content = fetch_elsevier(session, doi)
-        if not content:
-            processed.add(doi)
-            elapsed = time.time() - paper_start
-            print(f"timing: {elapsed:.3f}s for doi {doi}")
-            continue
-        files = extract_data_files(content)
-        if files:
-            url = doi_to_url.get(doi, "")
-            ex_rows = [(pid, url, link, 0) for link in files]
-            try:
-                cur.executemany(insert_extr_sql, ex_rows)
-                cur.execute(update_done_sql, (pid,))
-                db.commit()
-            except Exception:
-                db.rollback()
-        processed.add(doi)
-        elapsed = time.time() - paper_start
-        print(f"timing: {elapsed:.3f}s for doi {doi}")
-
-    cur.close()
-    db.close()
+    print("--- %s seconds ---" % (time.time() - start_time))
 
 
 if __name__ == "__main__":
-    start_time = time.time()
     main()
-    print("--- %s seconds ---" % (time.time() - start_time))

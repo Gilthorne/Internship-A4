@@ -20,9 +20,9 @@ cursor = db_connect.cursor(dictionary=True)
 
 def extract_data_files(content_text: str):
     """
-    Extrait:
-      - fichiers CSV / Excel
-      - liens GitHub / Zenodo / Mendeley / Elsevier
+    Extracts:
+      - CSV / Excel files
+      - GitHub / Zenodo / Mendeley / Elsevier links
     Returns: (count, list_of_files)
     """
     patterns = [
@@ -54,16 +54,16 @@ def extract_data_files(content_text: str):
     return len(unique), unique
 
 
-# Charger le JSON pour retrouver l'URL à partir du DOI
+# Load the JSON to find the URL from the DOI
 with open('ResearchTestLinks.json', encoding='utf-8') as f:
     links_data = json.load(f)
 
-# Construire un dict DOI -> url
+# Build a dict DOI -> url
 doi_to_url = {entry["doi"]: entry["url"] for entry in links_data}
 
 
-# 1) Récupérer tous les papiers de CLASSIFICATION où DONE = 0
-#    ATTENTION: on ne demande plus URL, puisque la colonne n'existe pas
+# 1) Retrieve all papers from CLASSIFICATION where DONE = 0
+#    WARNING: we no longer request URL, since the column does not exist
 cursor.execute("SELECT id, DOI, title FROM CLASSIFICATION WHERE DONE = 0")
 papers = cursor.fetchall()
 
@@ -72,7 +72,7 @@ for paper in papers:
     doi = paper["DOI"]
     title = paper["title"]
 
-    # récupérer l'URL correspondante depuis le JSON
+    # retrieve the corresponding URL from the JSON
     url = doi_to_url.get(doi, "")
 
     print(f"\n{title} (id={pid}, doi={doi})")
@@ -96,7 +96,7 @@ for paper in papers:
     print(f"  Number of files and links found: {count}")
     print(f"  Files: {files_list}")
 
-    # insérer une ligne dans EXTRACTION par data_link
+    # insert a row into EXTRACTION for each data_link
     for data_link in files_list:
         try:
             sql_insert = """
@@ -109,7 +109,7 @@ for paper in papers:
             print(f"  erreur: insertion EXTRACTION pour {data_link}")
             db_connect.rollback()
 
-    # marquer le papier comme terminé dans CLASSIFICATION
+    # mark the paper as done in CLASSIFICATION
     try:
         cursor.execute(
             "UPDATE CLASSIFICATION SET DONE = 1 WHERE id = %s",

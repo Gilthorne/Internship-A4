@@ -58,71 +58,10 @@ def get_db_connection():
     )
 
 
-def extract_authors_from_elsevier_json(text: str) -> str:
-    """
-    Extrait les auteurs depuis la réponse JSON de l'API Elsevier.
-
-    Pour ton cas, coredata["dc:creator"] est une liste de dicts :
-      { "@_fa": "true", "$": "Nom, Prénom" }
-
-    On renvoie "Nom, Prénom; Nom2, Prénom2; ..."
-    """
-    try:
-        data = json.loads(text)
-    except Exception:
-        return ""
-
-    # Certains endpoints emballent dans "full-text-retrieval-response"
-    ftr = data.get("full-text-retrieval-response")
-    if isinstance(ftr, dict):
-        core = ftr.get("coredata")
-    else:
-        core = data.get("coredata")
-
-    if not isinstance(core, dict):
-        return ""
-
-    authors = []
-
-    dc_creator = core.get("dc:creator")
-    # Cas principal : liste de dicts
-    if isinstance(dc_creator, list):
-        for item in dc_creator:
-            if isinstance(item, dict):
-                name = item.get("$")
-                if isinstance(name, str) and name.strip():
-                    authors.append(name.strip())
-            elif isinstance(item, str) and item.strip():
-                authors.append(item.strip())
-    # Cas plus simple : string
-    elif isinstance(dc_creator, str) and dc_creator.strip():
-        authors.append(dc_creator.strip())
-
-    # Fallback léger : "creator" si jamais
-    if not authors:
-        creator = core.get("creator")
-        if isinstance(creator, str) and creator.strip():
-            authors.append(creator.strip())
-        elif isinstance(creator, list):
-            for c in creator:
-                if isinstance(c, str) and c.strip():
-                    authors.append(c.strip())
-
-    # Déduplication + join
-    seen = set()
-    out = []
-    for a in authors:
-        if a not in seen:
-            seen.add(a)
-            out.append(a)
-
-    return "; ".join(out)
-
-
 def process_paper(entry, worker_id: int):
     """
-    - On lit DOI, title, url depuis ResearchTestLinks.json.
-    - On récupère auteurs + data links depuis l'API Elsevier (JSON).
+    - DOI, title, url viennent de ResearchTestLinks.json.
+    - Auteurs, Open_Access, data links viennent de l'API Elsevier (JSON).
     - Si DOI existe déjà :
         - DONE = 1 : on ignore.
         - DONE = 0 : on (ré)fait l'extraction puis DONE = 1.
@@ -148,9 +87,12 @@ def process_paper(entry, worker_id: int):
     cur = db.cursor()
     session = requests.Session()
 
-    # table CLASSIFICATION = (id, title, Authors, DOI, DONE)
+    # table CLASSIFICATION = (id, title, Authors, DOI, Open_Access, DONE)
     select_class_sql = "SELECT id, DONE FROM CLASSIFICATION WHERE DOI = %s"
-    insert_class_sql = "INSERT INTO CLASSIFICATION (title, Authors, DOI, DONE) VALUES (%s, %s, %s, %s)"
+    insert_class_sql = (
+        "INSERT INTO CLASSIFICATION (title, Authors, DOI, Open_Access, DONE) "
+        "VALUES (%s, %s, %s, %s, %s)"
+    )
     update_done_sql = "UPDATE CLASSIFICATION SET DONE = 1 WHERE id = %s"
     insert_extr_sql = "INSERT INTO EXTRACTION (pid, URL, data_link, done) VALUES (%s, %s, %s, %s)"
 
@@ -182,10 +124,70 @@ def process_paper(entry, worker_id: int):
             print(f"worker {worker_id}: timing {elapsed:.3f}s for doi {doi} (no content)")
             return
 
-        # 1bis) Récupérer les auteurs depuis la page (API JSON)
-        authors = extract_authors_from_elsevier_json(content)
+        # 1bis) Parser le JSON une fois
+        try:
+            data = json.loads(content)
+        except Exception:
+            elapsed = time.time() - paper_start
+            print(f"worker {worker_id}: timing {elapsed:.3f}s for doi {doi} (invalid JSON)")
+            return
 
-        # 1ter) Récupérer les data links depuis la page (API JSON)
+        # Récupérer coredata (comme dans le cookbook, mais en JSON)
+        ftr = data.get("full-text-retrieval-response")
+        if isinstance(ftr, dict):
+            core = ftr.get("coredata")
+        else:
+            core = data.get("coredata")
+
+        if not isinstance(core, dict):
+            elapsed = time.time() - paper_start
+            print(f"worker {worker_id}: timing {elapsed:.3f}s for doi {doi} (no coredata)")
+            return
+
+        # Auteurs (équivalent simple du get_elements(..., 'creator'))
+        authors_list = []
+        dc_creator = core.get("dc:creator")
+        if isinstance(dc_creator, list):
+            for item in dc_creator:
+                if isinstance(item, dict):
+                    name = item.get("$")
+                    if isinstance(name, str) and name.strip():
+                        authors_list.append(name.strip())
+                elif isinstance(item, str) and item.strip():
+                    authors_list.append(item.strip())
+        elif isinstance(dc_creator, str) and dc_creator.strip():
+            authors_list.append(dc_creator.strip())
+
+        # fallback très léger sur "creator"
+        creator = core.get("creator")
+        if not authors_list:
+            if isinstance(creator, str) and creator.strip():
+                authors_list.append(creator.strip())
+            elif isinstance(creator, list):
+                for c in creator:
+                    if isinstance(c, str) and c.strip():
+                        authors_list.append(c.strip())
+
+        # déduplication
+        seen = set()
+        authors_out = []
+        for a in authors_list:
+            if a not in seen:
+                seen.add(a)
+                authors_out.append(a)
+        authors_str = "; ".join(authors_out)
+
+        # Open Access (équivalent simple de get_element(core_data, "openaccessArticle"))
+        oa_article = core.get("openaccessArticle")
+        oa_flag = core.get("openaccess")
+        if isinstance(oa_article, str) and oa_article.lower() == "true":
+            open_access = True
+        elif isinstance(oa_flag, str) and oa_flag == "1":
+            open_access = True
+        else:
+            open_access = False
+
+        # Data links (comme avant, mais directement sur le texte brut)
         files = extract_data_files(content)
         if not files:
             elapsed = time.time() - paper_start
@@ -194,15 +196,17 @@ def process_paper(entry, worker_id: int):
 
         # 2) S'assurer d'avoir un pid dans CLASSIFICATION
         if pid is None:
-            # DOI n'existait pas encore -> on insère
             try:
-                cur.execute(insert_class_sql, (title, authors, doi, 0))  # DONE = 0 pour l'instant
+                cur.execute(
+                    insert_class_sql,
+                    (title, authors_str, doi, open_access, 0),  # DONE = 0 pour l'instant
+                )
                 pid = cur.lastrowid
                 db.commit()
             except Exception as e:
                 db.rollback()
                 print(f"worker {worker_id}: insert_class_sql error for doi {doi}: {e}", file=sys.stderr)
-                # Au cas où un autre thread l'a inséré entre-temps
+                # Au cas où un autre thread a inséré entre-temps
                 try:
                     cur.execute(select_class_sql, (doi,))
                     row2 = cur.fetchone()
@@ -242,7 +246,6 @@ def main():
         print(f"error: cannot read {JSON_PATH}: {e}", file=sys.stderr)
         return
 
-    # Only papers with a DOI are candidates
     entries = [e for e in links if e.get('doi')]
 
     num_workers = 4
@@ -252,7 +255,7 @@ def main():
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = []
         for idx, entry in enumerate(entries):
-            worker_id = idx % num_workers  # juste pour le logging
+            worker_id = idx % num_workers  # juste pour les logs
             futures.append(executor.submit(process_paper, entry, worker_id))
 
         for f in as_completed(futures):

@@ -58,13 +58,77 @@ def get_db_connection():
     )
 
 
+def extract_authors_from_elsevier_json(text: str) -> str:
+    """
+    Extrait les auteurs depuis la réponse JSON de l'API Elsevier.
+
+    Pour ton cas, coredata["dc:creator"] est une liste de dicts :
+      { "@_fa": "true", "$": "Nom, Prénom" }
+
+    On renvoie "Nom, Prénom; Nom2, Prénom2; ..."
+    """
+    try:
+        data = json.loads(text)
+    except Exception:
+        return ""
+
+    # Certains endpoints emballent dans "full-text-retrieval-response"
+    ftr = data.get("full-text-retrieval-response")
+    if isinstance(ftr, dict):
+        core = ftr.get("coredata")
+    else:
+        core = data.get("coredata")
+
+    if not isinstance(core, dict):
+        return ""
+
+    authors = []
+
+    dc_creator = core.get("dc:creator")
+    # Cas principal : liste de dicts
+    if isinstance(dc_creator, list):
+        for item in dc_creator:
+            if isinstance(item, dict):
+                name = item.get("$")
+                if isinstance(name, str) and name.strip():
+                    authors.append(name.strip())
+            elif isinstance(item, str) and item.strip():
+                authors.append(item.strip())
+    # Cas plus simple : string
+    elif isinstance(dc_creator, str) and dc_creator.strip():
+        authors.append(dc_creator.strip())
+
+    # Fallback léger : "creator" si jamais
+    if not authors:
+        creator = core.get("creator")
+        if isinstance(creator, str) and creator.strip():
+            authors.append(creator.strip())
+        elif isinstance(creator, list):
+            for c in creator:
+                if isinstance(c, str) and c.strip():
+                    authors.append(c.strip())
+
+    # Déduplication + join
+    seen = set()
+    out = []
+    for a in authors:
+        if a not in seen:
+            seen.add(a)
+            out.append(a)
+
+    return "; ".join(out)
+
+
 def process_paper(entry, worker_id: int):
     """
-    Multithreaded unit of work.
-
-    Behavior matches original single-threaded logic:
-    - If no data files found in Elsevier content -> do NOT insert into CLASSIFICATION.
-    - If data files found -> ensure a CLASSIFICATION row exists (DONE=1) and insert EXTRACTION rows.
+    - On lit DOI, title, url depuis ResearchTestLinks.json.
+    - On récupère auteurs + data links depuis l'API Elsevier (JSON).
+    - Si DOI existe déjà :
+        - DONE = 1 : on ignore.
+        - DONE = 0 : on (ré)fait l'extraction puis DONE = 1.
+    - Si DOI n'existe pas :
+        - pas de data -> rien en CLASSIFICATION.
+        - data -> CLASSIFICATION + EXTRACTION.
     """
     doi = entry.get('doi')
     if not doi:
@@ -75,7 +139,6 @@ def process_paper(entry, worker_id: int):
 
     paper_start = time.time()
 
-    # Each task gets its own DB connection and HTTP session
     try:
         db = get_db_connection()
     except Exception as e:
@@ -85,64 +148,82 @@ def process_paper(entry, worker_id: int):
     cur = db.cursor()
     session = requests.Session()
 
-    insert_class_sql = "INSERT INTO CLASSIFICATION (title, DOI, DONE) VALUES (%s, %s, %s)"
-    select_id_sql = "SELECT id FROM CLASSIFICATION WHERE DOI = %s"
+    # table CLASSIFICATION = (id, title, Authors, DOI, DONE)
+    select_class_sql = "SELECT id, DONE FROM CLASSIFICATION WHERE DOI = %s"
+    insert_class_sql = "INSERT INTO CLASSIFICATION (title, Authors, DOI, DONE) VALUES (%s, %s, %s, %s)"
     update_done_sql = "UPDATE CLASSIFICATION SET DONE = 1 WHERE id = %s"
     insert_extr_sql = "INSERT INTO EXTRACTION (pid, URL, data_link, done) VALUES (%s, %s, %s, %s)"
 
     try:
-        # 1) Fetch Elsevier content
+        # 0) Vérifier si le DOI existe déjà
+        try:
+            cur.execute(select_class_sql, (doi,))
+            row = cur.fetchone()
+        except Exception as e:
+            print(f"worker {worker_id}: select_class_sql error for doi {doi}: {e}", file=sys.stderr)
+            row = None
+
+        if row:
+            pid, done = row
+            if done:
+                elapsed = time.time() - paper_start
+                print(f"worker {worker_id}: doi {doi} already DONE, skipping ({elapsed:.3f}s)")
+                cur.close()
+                db.close()
+                return
+            # DONE = 0 -> on va (ré)faire l'extraction et mettre DONE = 1 à la fin
+        else:
+            pid = None  # pas encore de ligne CLASSIFICATION
+
+        # 1) Appel API Elsevier (JSON)
         content = fetch_elsevier(session, doi)
         if not content:
             elapsed = time.time() - paper_start
             print(f"worker {worker_id}: timing {elapsed:.3f}s for doi {doi} (no content)")
             return
 
+        # 1bis) Récupérer les auteurs depuis la page (API JSON)
+        authors = extract_authors_from_elsevier_json(content)
+
+        # 1ter) Récupérer les data links depuis la page (API JSON)
         files = extract_data_files(content)
         if not files:
-            # Match original behavior: do NOT insert into CLASSIFICATION if no data
             elapsed = time.time() - paper_start
             print(f"worker {worker_id}: timing {elapsed:.3f}s for doi {doi} (no files)")
             return
 
-        # 2) Ensure CLASSIFICATION row exists (only for papers with data)
-        pid = None
-        try:
-            cur.execute(insert_class_sql, (title, doi, 1))
-            pid = cur.lastrowid
-            db.commit()
-        except Exception:
-            # Likely duplicate DOI – row already exists
-            db.rollback()
+        # 2) S'assurer d'avoir un pid dans CLASSIFICATION
+        if pid is None:
+            # DOI n'existait pas encore -> on insère
             try:
-                cur.execute(select_id_sql, (doi,))
-                row = cur.fetchone()
-                pid = row[0] if row else None
+                cur.execute(insert_class_sql, (title, authors, doi, 0))  # DONE = 0 pour l'instant
+                pid = cur.lastrowid
+                db.commit()
             except Exception as e:
-                print(f"worker {worker_id}: select_id_sql error for doi {doi}: {e}", file=sys.stderr)
-                pid = None
-
-            if pid is not None:
-                # Make sure DONE is set to 1 (idempotent)
+                db.rollback()
+                print(f"worker {worker_id}: insert_class_sql error for doi {doi}: {e}", file=sys.stderr)
+                # Au cas où un autre thread l'a inséré entre-temps
                 try:
-                    cur.execute(update_done_sql, (pid,))
-                    db.commit()
-                except Exception:
-                    db.rollback()
+                    cur.execute(select_class_sql, (doi,))
+                    row2 = cur.fetchone()
+                    pid = row2[0] if row2 else None
+                except Exception as e2:
+                    print(f"worker {worker_id}: second select_class_sql error for doi {doi}: {e2}", file=sys.stderr)
+                    pid = None
 
         if pid is None:
-            # Could not get or create CLASSIFICATION row, give up on this DOI
             elapsed = time.time() - paper_start
             print(f"worker {worker_id}: timing {elapsed:.3f}s for doi {doi} (no pid)")
             return
 
-        # 3) Insert EXTRACTION rows (pid, URL, data_link, done=0)
+        # 3) Insérer dans EXTRACTION, puis marquer DONE = 1
         ex_rows = [(pid, url, link, 0) for link in files]
         try:
             cur.executemany(insert_extr_sql, ex_rows)
+            cur.execute(update_done_sql, (pid,))
             db.commit()
         except Exception as e:
-            print(f"worker {worker_id}: insert_extr_sql error for doi {doi}: {e}", file=sys.stderr)
+            print(f"worker {worker_id}: insert_extr/update_done error for doi {doi}: {e}", file=sys.stderr)
             db.rollback()
 
         elapsed = time.time() - paper_start
@@ -171,7 +252,7 @@ def main():
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = []
         for idx, entry in enumerate(entries):
-            worker_id = idx % num_workers  # just for log labeling
+            worker_id = idx % num_workers  # juste pour le logging
             futures.append(executor.submit(process_paper, entry, worker_id))
 
         for f in as_completed(futures):

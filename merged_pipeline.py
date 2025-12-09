@@ -15,11 +15,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 load_dotenv()
 API_KEY = os.getenv("ELSEVIER_API_KEY")
 JSON_PATH = "ResearchTestLinks.json"
-NUM_WORKERS = 4  # nombre de workers pour la step 2
+NUM_WORKERS = 4  # number of workers for step 2
 
-CURRENT_PAPER = None  # mis à jour dans les workers
+CURRENT_PAPER = None  # updated in workers for debugging
 
-# ================== Utilitaires communs ==================
+# ================== Common utilities ==================
 
 patterns = [
     r"\b\w+\.csv\b",
@@ -126,7 +126,7 @@ def map_files_to_elsevier_objects(files, objects_section):
 
 def make_elsevier_object_download_url(api_url: str) -> str:
     """
-    Transforme une URL d'objet Elsevier en URL Object Retrieval (view=STANDARD, bon httpAccept).
+    Transform an Elsevier object URL into an Object Retrieval URL (view=STANDARD, correct httpAccept).
     """
     import os
 
@@ -141,7 +141,7 @@ def make_elsevier_object_download_url(api_url: str) -> str:
     elif ext == ".csv":
         mime = "text/csv"
     else:
-        # autre type: on laisse le lien tel quel
+        # other type: leave the URL as is
         return api_url
 
     query = dict(parse_qsl(parsed.query))
@@ -154,25 +154,25 @@ def make_elsevier_object_download_url(api_url: str) -> str:
 
 def is_data_link_downloadable(link: str, session: requests.Session) -> bool:
     """
-    Vérifie si un data_link Elsevier (api.elsevier.com/content/object/eid/...)
-    correspond bien à un Excel ou un CSV téléchargeable.
+    Check if an Elsevier data_link (api.elsevier.com/content/object/eid/...)
+    corresponds to a downloadable Excel or CSV file.
 
-    Comportement:
-    - Si le lien N'EST PAS un objet Elsevier -> False.
-    - Si c'est un objet Elsevier:
-        * construit l'URL Object Retrieval (view=STANDARD + httpAccept Excel/CSV)
-        * exige:
+    Behavior:
+    - If the link is NOT an Elsevier object -> False.
+    - If it is an Elsevier object:
+        * build the Object Retrieval URL (view=STANDARD + httpAccept Excel/CSV)
+        * require:
             - status 200
-            - Content-Length > 0 (si présent)
-            - Content-Type cohérent (Excel ou CSV)
-            - contenu non vide, avec signature plausible :
-                - Excel : ZIP OOXML (PK..) ou vieux XLS (D0 CF 11 E0 ...)
-                - CSV  : texte non vide, pas une page d'erreur HTML/XML évidente
+            - Content-Length > 0 (if present)
+            - Content-Type consistent (Excel or CSV)
+            - non-empty content, with plausible signature:
+                - Excel: ZIP OOXML (PK..) or old XLS (D0 CF 11 E0 ...)
+                - CSV: non-empty text, not an obvious HTML/XML error page
     """
     if not isinstance(link, str) or not link.strip():
         return False
 
-    # On ne traite que les objets Elsevier ; les autres liens (Zenodo, GitHub, etc.) retournent False
+    # Only handle Elsevier object URLs; other links (Zenodo, GitHub, etc.) always return False
     if "api.elsevier.com/content/object/eid/" not in link:
         return False
 
@@ -197,13 +197,13 @@ def is_data_link_downloadable(link: str, session: requests.Session) -> bool:
     except ValueError:
         clen_int = None
 
-    # Taille nulle => pas bon
+    # Zero size => not good
     if clen_int is not None and clen_int <= 0:
         return False
 
-    sample = resp.content[:256]  # petit échantillon
+    sample = resp.content[:256]  # small sample
 
-    # ==== Cas Excel (XLS/XLSX) ====
+    # ==== Excel case (XLS/XLSX) ====
     if (
         "application/excel" in ctype
         or "application/vnd.ms-excel" in ctype
@@ -216,42 +216,42 @@ def is_data_link_downloadable(link: str, session: requests.Session) -> bool:
         if sample.startswith(b"PK\x03\x04"):
             return True
 
-        # Vieux XLS (compound binary)
+        # Old XLS (compound binary)
         if sample.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"):
             return True
 
-        # Autre binaire non vide : on reste prudent, on ne le valide pas
+        # Other non-empty binary: be cautious, do not validate
         return False
 
-    # ==== Cas CSV / texte ====
+    # ==== CSV / text case ====
     if "text/csv" in ctype or "text/plain" in ctype:
         text_sample = sample.decode("utf-8", errors="ignore").strip()
         if not text_sample:
             return False
 
         lower = text_sample.lower()
-        # Éviter les pages d'erreur HTML/XML évidentes
+        # Avoid obvious HTML/XML error pages
         if lower.startswith("<html") or lower.startswith("<!doctype html") or lower.startswith("<service-error"):
             return False
 
-        # Check très basique de "ressemblance CSV" (présence de séparateurs)
+        # Very basic "CSV-like" check: separators present
         if ("," in text_sample) or (";" in text_sample) or ("\t" in text_sample):
             return True
 
-        # Sinon: texte non vide mais pas forcément CSV → on peut rester permissif
+        # Otherwise: non-empty text but not clearly CSV -> still accept as data
         return True
 
-    # Autre Content-Type: on ne considère pas que c'est notre Excel/CSV cible
+    # Other Content-Type: we don't consider it as target Excel/CSV
     return False
 
 
-# ================== Étape 1 ==================
+# ================== Step 1 ==================
 
 def step1_load_classification():
     """
-    Étape 1 :
-    - Lit ResearchTestLinks.json
-    - Insère dans CLASSIFICATION (DONE=0, Has_data=0) si DOI pas déjà présent.
+    Step 1:
+    - Read ResearchTestLinks.json
+    - Insert into CLASSIFICATION (DONE=0, Has_data=0) if DOI is not already present.
     """
     try:
         with open(JSON_PATH, encoding="utf-8") as f:
@@ -282,7 +282,7 @@ def step1_load_classification():
             cur.execute(select_sql, (doi,))
             row = cur.fetchone()
             if row:
-                continue  # déjà présent
+                continue  # already present
 
             # Authors="", Open_Access=False, Has_data=False, DONE=False
             cur.execute(insert_sql, (title, "", doi, False, False, False))
@@ -296,21 +296,21 @@ def step1_load_classification():
     db.close()
 
 
-# ================== Étape 2 (multi‑threadée, avec worker_id & CURRENT_PAPER) ==================
+# ================== Step 2 (multi-threaded, with worker_id & CURRENT_PAPER) ==================
 
 def process_one_paper_step2(row, worker_id: int):
     """
-    Fonction appelée dans les workers.
+    Function called in worker threads.
     row: (id, title, DOI, DONE)
-    Remplit EXTRACTION si data, met Has_data=True si data, DONE=True dans CLASSIFICATION.
-    Chaque worker ouvre sa propre connexion DB + Session.
+    Fills EXTRACTION if data found, sets Has_data=True if any, DONE=True in CLASSIFICATION.
+    Each worker opens its own DB connection + HTTP session.
     """
     global CURRENT_PAPER
 
     pid, title, doi, done = row
     start = time.time()
 
-    # Met à jour CURRENT_PAPER pour le debug en cas de crash
+    # Update CURRENT_PAPER for debugging in case of crash
     CURRENT_PAPER = {"pid": pid, "doi": doi, "title": title, "worker": worker_id}
 
     db = get_db_connection()
@@ -348,7 +348,7 @@ def process_one_paper_step2(row, worker_id: int):
             print(f"[STEP2][worker {worker_id}] PID {pid} DOI {doi}: no coredata ({elapsed:.3f}s)")
             return
 
-        # 1) Auteurs + OpenAccess
+        # 1) Authors + OpenAccess
         authors_list = []
         dc_creator = core.get("dc:creator")
         if isinstance(dc_creator, list):
@@ -387,15 +387,15 @@ def process_one_paper_step2(row, worker_id: int):
         elif isinstance(oa_flag, str) and oa_flag == "1":
             open_access = True
 
-        # 2) Liens data : regex sur le JSON complet
+        # 2) Data links: regex over the full JSON response
         files = extract_data_files(content)
 
-        # 3) Map mmcX.xlsx -> URLs d'objets Elsevier quand possible
+        # 3) Map mmcX.xlsx -> Elsevier object URLs when possible
         objects_section = ftr.get("objects", {}).get("object")
         if objects_section:
             files = map_files_to_elsevier_objects(files, objects_section)
 
-        # 3bis) Normaliser les URLs d'objets Elsevier (Object Retrieval)
+        # 3bis) Normalize Elsevier object URLs (Object Retrieval)
         normalized_files = []
         for link in files:
             if isinstance(link, str) and "api.elsevier.com/content/object/eid/" in link:
@@ -406,7 +406,7 @@ def process_one_paper_step2(row, worker_id: int):
 
         has_data = bool(files)
 
-        # 4) Mettre à jour CLASSIFICATION (Authors, OA, Has_data, DONE=True)
+        # 4) Update CLASSIFICATION (Authors, OA, Has_data, DONE=True)
         update_class_sql = (
             "UPDATE CLASSIFICATION SET Authors = %s, Open_Access = %s, Has_data = %s, DONE = %s "
             "WHERE id = %s"
@@ -420,12 +420,12 @@ def process_one_paper_step2(row, worker_id: int):
             print(f"[STEP2][worker {worker_id}] PID {pid} DOI {doi}: error updating CLASSIFICATION: {e} ({elapsed:.3f}s)", file=sys.stderr)
             return
 
-        # 5) Insérer dans EXTRACTION si on a des fichiers
+        # 5) Insert into EXTRACTION if we have files
         if files:
             insert_extr_sql = (
                 "INSERT INTO EXTRACTION (pid, URL, data_link, done) VALUES (%s, %s, %s, %s)"
             )
-            # done = 0 ici ; la vérification se fait en Step 3
+            # done = 0 here; verification is done in Step 3
             ex_rows = [(pid, f"https://doi.org/{doi}", link, 0) for link in files]
             try:
                 cur.executemany(insert_extr_sql, ex_rows)

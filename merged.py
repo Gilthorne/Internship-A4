@@ -25,14 +25,24 @@ patterns = [
 ]
 
 
-def extract_data_files(text: str):
+def extract_data_files(text: str):  
     found = []
     for p in patterns:
         found.extend(re.findall(p, text, re.IGNORECASE))
-    normalized = [x.rstrip('.') for x in found]
+    normalized = [x.rstrip('.,);]') for x in found]
+
     seen = set()
     out = []
+    ignore = {
+        "http://www.elsevier.com/open-access/userlicense/1.0/",
+        "https://www.elsevier.com/locate/withdrawalpolicy",
+        "https://www.elsevier.com/about/policies/article-withdrawal"
+    }
     for x in normalized:
+        # ignorer exactement cette URL
+        if x.lower() in ignore:
+            continue
+
         if x not in seen:
             seen.add(x)
             out.append(x)
@@ -40,7 +50,6 @@ def extract_data_files(text: str):
 
 
 def fetch_elsevier(session: requests.Session, doi: str):
-    # on reconstruit l'URL Elsevier à partir du DOI "nu"
     url = f'https://api.elsevier.com/content/article/doi/{urllib.parse.quote(doi)}'
     headers = {'X-ELS-APIKey': API_KEY, 'Accept': 'application/json'}
     try:
@@ -61,23 +70,12 @@ def get_db_connection():
 
 
 def extract_doi_from_link(doi_link: str) -> str | None:
-    """
-    Extrait le DOI "nu" depuis un doi_link du type:
-      https://doi.org/10.35341/afet.1295681
-    Renvoie "10.35341/afet.1295681" ou None si échec.
-    """
     if not doi_link:
         return None
-
-    # 1) passer par urlparse pour enlever le schéma / host
     parsed = urllib.parse.urlparse(doi_link)
-    path = parsed.path.lstrip('/')  # "10.35341/afet.1295681"
-
+    path = parsed.path.lstrip('/')
     if path:
         return path
-
-    # fallback ultra simple au cas où
-    # (garde la partie après le dernier "/")
     parts = doi_link.split('doi.org/', 1)
     if len(parts) == 2 and parts[1]:
         return parts[1].lstrip('/')
@@ -85,27 +83,13 @@ def extract_doi_from_link(doi_link: str) -> str | None:
 
 
 def process_paper(entry, worker_id: int):
-    """
-    - doi_link, title, citations viennent du JSON.
-    - DOI "nu" est extrait de doi_link.
-    - Auteurs, Open_Access, data links viennent de l'API Elsevier (JSON).
-    - Si DOI existe déjà :
-        - DONE = 1 : on ignore.
-        - DONE = 0 : on (ré)fait l'extraction puis DONE = 1.
-    - Si DOI n'existe pas :
-        - pas de data -> rien en CLASSIFICATION.
-        - data -> CLASSIFICATION + EXTRACTION.
-    """
     doi_link = entry.get('doi_link')
     doi = extract_doi_from_link(doi_link)
 
     if not doi:
-        # pas de DOI exploitable -> on ignore
         return
 
-    # titre fourni dans le JSON d'entrée (fallback)
     title_from_json = entry.get('title', '')
-    # pour les tables EXTRACTION.URL, on utilise le doi_link
     url = doi_link or ''
 
     paper_start = time.time()
@@ -119,13 +103,15 @@ def process_paper(entry, worker_id: int):
     cur = db.cursor()
     session = requests.Session()
 
-    # table CLASSIFICATION = (id, title, Authors, DOI, Open_Access, DONE)
+    # CLASSIFICATION = (id, title, Authors, DOI, Open_Access, Has_data, DONE)
     select_class_sql = "SELECT id, DONE FROM CLASSIFICATION WHERE DOI = %s"
     insert_class_sql = (
-        "INSERT INTO CLASSIFICATION (title, Authors, DOI, Open_Access, DONE) "
-        "VALUES (%s, %s, %s, %s, %s)"
+        "INSERT INTO CLASSIFICATION (title, Authors, DOI, Open_Access, Has_data, DONE) "
+        "VALUES (%s, %s, %s, %s, %s, %s)"
     )
-    update_done_sql = "UPDATE CLASSIFICATION SET DONE = 1 WHERE id = %s"
+    update_done_sql = (
+        "UPDATE CLASSIFICATION SET Open_Access = %s, Has_data = %s, DONE = %s WHERE id = %s"
+    )
     insert_extr_sql = "INSERT INTO EXTRACTION (pid, URL, data_link, done) VALUES (%s, %s, %s, %s)"
 
     try:
@@ -145,26 +131,71 @@ def process_paper(entry, worker_id: int):
                 cur.close()
                 db.close()
                 return
-            # DONE = 0 -> on va (ré)faire l'extraction et mettre DONE = 1 à la fin
         else:
-            pid = None  # pas encore de ligne CLASSIFICATION
+            pid = None
 
         # 1) Appel API Elsevier (JSON) à partir du DOI nu
         content = fetch_elsevier(session, doi)
         if not content:
             elapsed = time.time() - paper_start
             print(f"worker {worker_id}: timing {elapsed:.3f}s for doi {doi} (no content)")
+            # même sans contenu, on insère au moins la ligne classification sans data
+            authors_str = ""
+            open_access = False
+            has_data = False
+            if pid is None:
+                try:
+                    cur.execute(
+                        insert_class_sql,
+                        (title_from_json or 'N/A', authors_str, doi, open_access, has_data, True),
+                    )
+                    db.commit()
+                except Exception as e:
+                    db.rollback()
+                    print(f"worker {worker_id}: insert_class_sql(no content) error for doi {doi}: {e}", file=sys.stderr)
+            else:
+                try:
+                    cur.execute(
+                        update_done_sql,
+                        (open_access, has_data, True, pid),
+                    )
+                    db.commit()
+                except Exception as e:
+                    db.rollback()
+                    print(f"worker {worker_id}: update_done_sql(no content) error for doi {doi}: {e}", file=sys.stderr)
             return
 
-        # 1bis) Parser le JSON une fois
         try:
             data = json.loads(content)
         except Exception:
             elapsed = time.time() - paper_start
             print(f"worker {worker_id}: timing {elapsed:.3f}s for doi {doi} (invalid JSON)")
+            # pareil : on enregistre quand même le papier sans data
+            authors_str = ""
+            open_access = False
+            has_data = False
+            if pid is None:
+                try:
+                    cur.execute(
+                        insert_class_sql,
+                        (title_from_json or 'N/A', authors_str, doi, open_access, has_data, True),
+                    )
+                    db.commit()
+                except Exception as e:
+                    db.rollback()
+                    print(f"worker {worker_id}: insert_class_sql(invalid JSON) error for doi {doi}: {e}", file=sys.stderr)
+            else:
+                try:
+                    cur.execute(
+                        update_done_sql,
+                        (open_access, has_data, True, pid),
+                    )
+                    db.commit()
+                except Exception as e:
+                    db.rollback()
+                    print(f"worker {worker_id}: update_done_sql(invalid JSON) error for doi {doi}: {e}", file=sys.stderr)
             return
 
-        # Récupérer coredata
         ftr = data.get("full-text-retrieval-response")
         if isinstance(ftr, dict):
             core = ftr.get("coredata")
@@ -174,6 +205,29 @@ def process_paper(entry, worker_id: int):
         if not isinstance(core, dict):
             elapsed = time.time() - paper_start
             print(f"worker {worker_id}: timing {elapsed:.3f}s for doi {doi} (no coredata)")
+            authors_str = ""
+            open_access = False
+            has_data = False
+            if pid is None:
+                try:
+                    cur.execute(
+                        insert_class_sql,
+                        (title_from_json or 'N/A', authors_str, doi, open_access, has_data, True),
+                    )
+                    db.commit()
+                except Exception as e:
+                    db.rollback()
+                    print(f"worker {worker_id}: insert_class_sql(no coredata) error for doi {doi}: {e}", file=sys.stderr)
+            else:
+                try:
+                    cur.execute(
+                        update_done_sql,
+                        (open_access, has_data, True, pid),
+                    )
+                    db.commit()
+                except Exception as e:
+                    db.rollback()
+                    print(f"worker {worker_id}: update_done_sql(no coredata) error for doi {doi}: {e}", file=sys.stderr)
             return
 
         # Auteurs
@@ -207,7 +261,7 @@ def process_paper(entry, worker_id: int):
                 authors_out.append(a)
         authors_str = "; ".join(authors_out)
 
-        # Titre (on prend en priorité celui de l'API)
+        # Titre
         title_text = None
         title_val = core.get("dc:title") if core.get("dc:title") is not None else core.get("title")
         if isinstance(title_val, str) and title_val.strip():
@@ -247,30 +301,26 @@ def process_paper(entry, worker_id: int):
 
         # Data links
         files = extract_data_files(content)
-        if not files:
-            elapsed = time.time() - paper_start
-            print(f"worker {worker_id}: timing {elapsed:.3f}s for doi {doi} (no files)")
-            return
+        has_data = bool(files)
 
         # 2) S'assurer d'avoir un pid dans CLASSIFICATION
         if pid is None:
             try:
                 cur.execute(
                     insert_class_sql,
-                    (title_text, authors_str, doi, open_access, 0),  # DONE = 0 pour l'instant
+                    (title_text, authors_str, doi, open_access, has_data, 0),
                 )
                 pid = cur.lastrowid
                 db.commit()
             except Exception as e:
                 db.rollback()
                 print(f"worker {worker_id}: insert_class_sql error for doi {doi}: {e}", file=sys.stderr)
-                # Au cas où un autre thread a inséré entre-temps
                 try:
-                    cur.execute(select_class_sql, (doi,))
+                    cur.execute("SELECT id FROM CLASSIFICATION WHERE DOI = %s", (doi,))
                     row2 = cur.fetchone()
                     pid = row2[0] if row2 else None
                 except Exception as e2:
-                    print(f"worker {worker_id}: second select_class_sql error for doi {doi}: {e2}", file=sys.stderr)
+                    print(f"worker {worker_id}: second select id error for doi {doi}: {e2}", file=sys.stderr)
                     pid = None
 
         if pid is None:
@@ -278,19 +328,31 @@ def process_paper(entry, worker_id: int):
             print(f"worker {worker_id}: timing {elapsed:.3f}s for doi {doi} (no pid)")
             return
 
-        # 3) Insérer dans EXTRACTION, puis marquer DONE = 1
-        #    URL = doi_link (colonne inchangée)
-        ex_rows = [(pid, url, link, 0) for link in files]
+        # 3) Si on a des fichiers, les insérer dans EXTRACTION
+        if files:
+            ex_rows = [(pid, url, link, 0) for link in files]
+            try:
+                cur.executemany(insert_extr_sql, ex_rows)
+            except Exception as e:
+                print(f"worker {worker_id}: insert_extr error for doi {doi}: {e}", file=sys.stderr)
+                db.rollback()
+                elapsed = time.time() - paper_start
+                print(f"worker {worker_id}: timing {elapsed:.3f}s for doi {doi} (error inserting extraction)")
+                return
+
+        # 4) Mettre à jour CLASSIFICATION pour marquer DONE = True et Has_data correct
         try:
-            cur.executemany(insert_extr_sql, ex_rows)
-            cur.execute(update_done_sql, (pid,))
+            cur.execute(
+                update_done_sql,
+                (open_access, has_data, True, pid),
+            )
             db.commit()
         except Exception as e:
-            print(f"worker {worker_id}: insert_extr/update_done error for doi {doi}: {e}", file=sys.stderr)
             db.rollback()
+            print(f"worker {worker_id}: update_done_sql error for doi {doi}: {e}", file=sys.stderr)
 
         elapsed = time.time() - paper_start
-        print(f"worker {worker_id}: timing {elapsed:.3f}s for doi {doi}")
+        print(f"worker {worker_id}: timing {elapsed:.3f}s for doi {doi} (has_data={has_data})")
 
     finally:
         cur.close()
@@ -305,7 +367,6 @@ def main():
         print(f"error: cannot read {JSON_PATH}: {e}", file=sys.stderr)
         return
 
-    # on ne filtre plus sur 'doi', mais sur 'doi_link'
     entries = [e for e in links if e.get('doi_link')]
 
     num_workers = 4

@@ -394,7 +394,7 @@ def process_paper(entry, worker_id: int):
                     print(f"worker {worker_id}: update_extr_done_sql error for DOI {doi}, link {link}: {e}", file=sys.stderr)
             db.commit()
 
-        # 6) Mark DONE + Has_data dans CLASSIFICATION (inchangé : DONE toujours True ici)
+        # 6) Mark DONE + Has_data in CLASSIFICATION
         try:
             cur.execute(update_done_sql, (open_access, has_data, True, pid))
             db.commit()

@@ -18,3 +18,4 @@
 /*.php
 elsevier_parse.py
 test_downloadlink.py
+test_year_affiliation.py

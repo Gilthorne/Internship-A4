@@ -16,3 +16,5 @@
 /Old_folder/*
 /*.env
 /*.php
+elsevier_parse.py
+test_downloadlink.py

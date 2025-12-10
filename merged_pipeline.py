@@ -45,7 +45,7 @@ def extract_doi_from_link(doi_link: str) -> str | None:
     return None
 
 
-def http_get_with_retries(session: requests.Session, url: str, headers: dict, max_retries: int = 3) -> requests.Response | None:
+def http_get_with_retries(session: requests.Session, url: str, headers: dict, max_retries: int = 5) -> requests.Response | None:
     last_err = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -53,7 +53,7 @@ def http_get_with_retries(session: requests.Session, url: str, headers: dict, ma
             if 500 <= r.status_code < 600:
                 last_err = requests.HTTPError(f"HTTP {r.status_code}")
                 if attempt < max_retries:
-                    time.sleep(2*attempt)
+                    time.sleep(3*attempt)
                     continue
                 break
             r.raise_for_status()

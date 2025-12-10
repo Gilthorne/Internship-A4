@@ -328,7 +328,7 @@ def step2_extract_data_links():
                 print(f"[STEP2] worker error: {e}", file=sys.stderr)
 
 
-# ================== STEP 3: vérifier data_link ==================
+# ================== STEP 3: verify data_link ==================
 
 def is_data_link_downloadable(link: str, session: requests.Session) -> bool:
     if not isinstance(link, str) or not link.strip():

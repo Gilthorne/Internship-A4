@@ -2,48 +2,32 @@
 import os
 import json
 import re
-import urllib.parse
 import sys
 import time
+import urllib.parse
 from urllib.parse import urlparse, urlencode, urlunparse, parse_qsl
-
-from dotenv import load_dotenv
-import requests
-import mysql.connector as sql
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import mysql.connector as sql
+import requests
+from dotenv import load_dotenv
+
 load_dotenv()
+
 API_KEY = os.getenv("ELSEVIER_API_KEY")
 JSON_PATH = "ResearchTestLinks.json"
-NUM_WORKERS = 4  # number of workers for step 2
+NUM_WORKERS = 4
 
-CURRENT_PAPER = None  # updated in workers for debugging
+CURRENT_PAPER = None
 
-# ================== Common utilities ==================
-
-patterns = [
-    r"\b\w+\.csv\b",
-    r"\b\w+\.xlsx?\b",
-    r"https?://(?:dx\.)?doi\.org/10\.\d{4,9}/zenodo\.\d+\b",
-    r"https?://data.mendeley\.com/datasets/[^\s\"]+",
-    r"https?://github\.com/[^\s\"]+",
-    r"https?://zenodo\.org/[^\s\"]+",
-    r"https?://(?:www\.)?elsevier\.com/[^\s\"]+",
-]
-
-IGNORED_LINKS = {
-    "http://www.elsevier.com/open-access/userlicense/1.0/",
-    "https://www.elsevier.com/locate/withdrawalpolicy",
-    "https://www.elsevier.com/about/policies/article-withdrawal",
-}
-
+# ================== Utils ==================
 
 def get_db_connection():
     return sql.connect(
-        user=str(os.getenv("DB_USER")),
-        password=str(os.getenv("DB_PASSWORD")),
-        host=str(os.getenv("DB_HOST")),
-        database=str(os.getenv("DB_NAME")),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        host=os.getenv("DB_HOST"),
+        database=os.getenv("DB_NAME"),
         autocommit=False,
     )
 
@@ -61,203 +45,42 @@ def extract_doi_from_link(doi_link: str) -> str | None:
     return None
 
 
-def fetch_elsevier(session: requests.Session, doi: str) -> str:
-    url = f"https://api.elsevier.com/content/article/doi/{urllib.parse.quote(doi)}"
-    headers = {"X-ELS-APIKey": API_KEY, "Accept": "application/json"}
-    try:
-        r = session.get(url, headers=headers, timeout=20)
-        return r.content.decode("utf-8", errors="ignore")
-    except Exception:
-        return ""
+def http_get_with_retries(session: requests.Session, url: str, headers: dict, max_retries: int = 3) -> requests.Response | None:
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = session.get(url, headers=headers)
+            if 500 <= r.status_code < 600:
+                last_err = requests.HTTPError(f"HTTP {r.status_code}")
+                if attempt < max_retries:
+                    time.sleep(2)
+                    continue
+                break
+            r.raise_for_status()
+            return r
+        except requests.HTTPError as e:
+            last_err = e
+            if not (e.response is not None and 500 <= e.response.status_code < 600):
+                return None
+        except Exception as e:
+            last_err = e
+            return None
+    print(f"[HTTP] {url}: giving up after retries ({last_err})", file=sys.stderr)
+    return None
 
 
-def extract_data_files(text: str):
-    found = []
-    for p in patterns:
-        found.extend(re.findall(p, text, re.IGNORECASE))
-
-    normalized = [x.rstrip(".,);]") for x in found]
-
-    seen = set()
-    out = []
-    for x in normalized:
-        if x.lower() in IGNORED_LINKS:
-            continue
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
+def make_session() -> requests.Session:
+    return requests.Session()
 
 
-def map_files_to_elsevier_objects(files, objects_section):
-    """
-    Map file names like 'mmc6.xlsx' to the corresponding Elsevier object URLs.
-    """
-    import os
-
-    if not objects_section:
-        return files
-
-    if isinstance(objects_section, dict):
-        multimedia_objects = [objects_section]
-    elif isinstance(objects_section, list):
-        multimedia_objects = objects_section
-    else:
-        return files
-
-    ref_to_url = {}
-    for obj in multimedia_objects:
-        if not isinstance(obj, dict):
-            continue
-        ref = obj.get("@ref")
-        href = obj.get("$")
-        if isinstance(ref, str) and href:
-            ref_to_url[ref] = href
-
-    out = []
-    for f in files:
-        base = os.path.splitext(os.path.basename(f))[0]  # 'mmc6.xlsx' -> 'mmc6'
-        if base in ref_to_url:
-            out.append(ref_to_url[base])
-        else:
-            out.append(f)
-    return out
-
-
-def make_elsevier_object_download_url(api_url: str) -> str:
-    """
-    Transform an Elsevier object URL into an Object Retrieval URL (view=STANDARD, correct httpAccept).
-    """
-    import os
-
-    try:
-        parsed = urlparse(api_url)
-    except Exception:
-        return api_url
-
-    ext = os.path.splitext(parsed.path)[1].lower()
-    if ext in [".xlsx", ".xls"]:
-        mime = "application/excel"
-    elif ext == ".csv":
-        mime = "text/csv"
-    else:
-        # other type: leave the URL as is
-        return api_url
-
-    query = dict(parse_qsl(parsed.query))
-    query["view"] = "STANDARD"
-    query["httpAccept"] = mime
-
-    new_query = urlencode(query)
-    return urlunparse(parsed._replace(query=new_query))
-
-
-def is_data_link_downloadable(link: str, session: requests.Session) -> bool:
-    """
-    Check if an Elsevier data_link (api.elsevier.com/content/object/eid/...)
-    corresponds to a downloadable Excel or CSV file.
-
-    Behavior:
-    - If the link is NOT an Elsevier object -> False.
-    - If it is an Elsevier object:
-        * build the Object Retrieval URL (view=STANDARD + httpAccept Excel/CSV)
-        * require:
-            - status 200
-            - Content-Length > 0 (if present)
-            - Content-Type consistent (Excel or CSV)
-            - non-empty content, with plausible signature:
-                - Excel: ZIP OOXML (PK..) or old XLS (D0 CF 11 E0 ...)
-                - CSV: non-empty text, not an obvious HTML/XML error page
-    """
-    if not isinstance(link, str) or not link.strip():
-        return False
-
-    # Only handle Elsevier object URLs; other links (Zenodo, GitHub, etc.) always return False
-    if "api.elsevier.com/content/object/eid/" not in link:
-        return False
-
-    url = make_elsevier_object_download_url(link)
-    headers = {
-        "X-ELS-APIKey": API_KEY,
-        "Accept": "*/*",
-    }
-
-    try:
-        resp = session.get(url, headers=headers, stream=True, timeout=20)
-    except Exception:
-        return False
-
-    if resp.status_code != 200:
-        return False
-
-    ctype = (resp.headers.get("Content-Type") or "").lower()
-    clen = resp.headers.get("Content-Length")
-    try:
-        clen_int = int(clen) if clen is not None else None
-    except ValueError:
-        clen_int = None
-
-    # Zero size => not good
-    if clen_int is not None and clen_int <= 0:
-        return False
-
-    sample = resp.content[:256]  # small sample
-
-    # ==== Excel case (XLS/XLSX) ====
-    if (
-        "application/excel" in ctype
-        or "application/vnd.ms-excel" in ctype
-        or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in ctype
-    ):
-        if not sample:
-            return False
-
-        # XLSX OOXML (ZIP)
-        if sample.startswith(b"PK\x03\x04"):
-            return True
-
-        # Old XLS (compound binary)
-        if sample.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"):
-            return True
-
-        # Other non-empty binary: be cautious, do not validate
-        return False
-
-    # ==== CSV / text case ====
-    if "text/csv" in ctype or "text/plain" in ctype:
-        text_sample = sample.decode("utf-8", errors="ignore").strip()
-        if not text_sample:
-            return False
-
-        lower = text_sample.lower()
-        # Avoid obvious HTML/XML error pages
-        if lower.startswith("<html") or lower.startswith("<!doctype html") or lower.startswith("<service-error"):
-            return False
-
-        # Very basic "CSV-like" check: separators present
-        if ("," in text_sample) or (";" in text_sample) or ("\t" in text_sample):
-            return True
-
-        # Otherwise: non-empty text but not clearly CSV -> still accept as data
-        return True
-
-    # Other Content-Type: we don't consider it as target Excel/CSV
-    return False
-
-
-# ================== Step 1 ==================
+# ================== STEP 1: JSON -> CLASSIFICATION ==================
 
 def step1_load_classification():
-    """
-    Step 1:
-    - Read ResearchTestLinks.json
-    - Insert into CLASSIFICATION (DONE=0, Has_data=0) if DOI is not already present.
-    """
     try:
         with open(JSON_PATH, encoding="utf-8") as f:
             links = json.load(f)
     except Exception as e:
-        print(f"[STEP1] error: cannot read {JSON_PATH}: {e}", file=sys.stderr)
+        print(f"[STEP1] cannot read {JSON_PATH}: {e}", file=sys.stderr)
         return
 
     entries = [e for e in links if e.get("doi_link")]
@@ -272,173 +95,214 @@ def step1_load_classification():
     )
 
     for entry in entries:
-        doi_link = entry.get("doi_link")
-        doi = extract_doi_from_link(doi_link)
-        title = entry.get("title", "") or "N/A"
+        doi = extract_doi_from_link(entry.get("doi_link"))
+        title = entry.get("title") or "N/A"
         if not doi:
             continue
 
         try:
             cur.execute(select_sql, (doi,))
-            row = cur.fetchone()
-            if row:
-                continue  # already present
-
-            # Authors="", Open_Access=False, Has_data=False, DONE=False
+            if cur.fetchone():
+                continue
             cur.execute(insert_sql, (title, "", doi, False, False, False))
             db.commit()
-            print(f"[STEP1] Inserted DOI {doi} into CLASSIFICATION")
+            print(f"[STEP1] Inserted {doi}")
         except Exception as e:
             db.rollback()
-            print(f"[STEP1] Error inserting DOI {doi}: {e}", file=sys.stderr)
+            print(f"[STEP1] Error inserting {doi}: {e}", file=sys.stderr)
 
     cur.close()
     db.close()
 
 
-# ================== Step 2 (multi-threaded, with worker_id & CURRENT_PAPER) ==================
+# ================== STEP 2: Article API -> EXTRACTION ==================
+
+PATTERNS = [
+    r"\b\w+\.csv\b",
+    r"\b\w+\.xlsx?\b",
+    r"https?://(?:dx\.)?doi\.org/10\.\d{4,9}/zenodo\.\d+\b",
+    r"https?://data.mendeley\.com/datasets/[^\s\"]+",
+    r"https?://github\.com/[^\s\"]+",
+    r"https?://zenodo\.org/[^\s\"]+",
+    r"https?://(?:www\.)?elsevier\.com/[^\s\"]+",
+]
+
+IGNORED_LINKS = {
+    "http://www.elsevier.com/open-access/userlicense/1.0/",
+    "https://www.elsevier.com/locate/withdrawalpolicy",
+    "https://www.elsevier.com/about/policies/article-withdrawal",
+}
+
+
+def extract_data_files(text: str):
+    found = []
+    for p in PATTERNS:
+        found.extend(re.findall(p, text, re.IGNORECASE))
+    normalized = [x.rstrip(".,);]") for x in found]
+    seen, out = set(), []
+    for x in normalized:
+        if x.lower() in IGNORED_LINKS:
+            continue
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def map_files_to_elsevier_objects(files, objects_section):
+    import os
+    if not objects_section:
+        return files
+    if isinstance(objects_section, dict):
+        multimedia_objects = [objects_section]
+    else:
+        multimedia_objects = list(objects_section)
+
+    ref_to_url = {}
+    for obj in multimedia_objects:
+        if not isinstance(obj, dict):
+            continue
+        ref = obj.get("@ref")
+        href = obj.get("$")
+        if isinstance(ref, str) and href:
+            ref_to_url[ref] = href
+
+    out = []
+    for f in files:
+        base = os.path.splitext(os.path.basename(f))[0]
+        out.append(ref_to_url.get(base, f))
+    return out
+
+
+def make_elsevier_object_download_url(api_url: str) -> str:
+    import os
+    try:
+        parsed = urlparse(api_url)
+    except Exception:
+        return api_url
+    ext = os.path.splitext(parsed.path)[1].lower()
+    if ext in (".xlsx", ".xls"):
+        mime = "application/excel"
+    elif ext == ".csv":
+        mime = "text/csv"
+    else:
+        return api_url
+    query = dict(parse_qsl(parsed.query))
+    query["view"] = "STANDARD"
+    query["httpAccept"] = mime
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
 
 def process_one_paper_step2(row, worker_id: int):
-    """
-    Function called in worker threads.
-    row: (id, title, DOI, DONE)
-    Fills EXTRACTION if data found, sets Has_data=True if any, DONE=True in CLASSIFICATION.
-    Each worker opens its own DB connection + HTTP session.
-    """
     global CURRENT_PAPER
-
     pid, title, doi, done = row
     start = time.time()
-
-    # Update CURRENT_PAPER for debugging in case of crash
     CURRENT_PAPER = {"pid": pid, "doi": doi, "title": title, "worker": worker_id}
 
     db = get_db_connection()
     cur = db.cursor()
-    session = requests.Session()
+    session = make_session()
 
     try:
         if done:
-            elapsed = time.time() - start
-            print(f"[STEP2][worker {worker_id}] PID {pid} DOI {doi}: already DONE, skipping ({elapsed:.3f}s)")
+            print(f"[STEP2][{worker_id}] PID {pid} DOI {doi}: DONE, skip")
             return
 
-        content = fetch_elsevier(session, doi)
-        if not content:
-            elapsed = time.time() - start
-            print(f"[STEP2][worker {worker_id}] PID {pid} DOI {doi}: no content from Elsevier ({elapsed:.3f}s)")
+        if not API_KEY:
+            print("[STEP2] ELSEVIER_API_KEY missing", file=sys.stderr)
+            return
+
+        url = "https://api.elsevier.com/content/article/doi/" + urllib.parse.quote(doi)
+        resp = http_get_with_retries(session, url, {"X-ELS-APIKey": API_KEY, "Accept": "application/json"})
+        if not resp:
+            print(f"[STEP2][{worker_id}] PID {pid} DOI {doi}: no response")
             return
 
         try:
-            data = json.loads(content)
+            data = resp.json()
         except Exception as e:
-            elapsed = time.time() - start
-            print(f"[STEP2][worker {worker_id}] PID {pid} DOI {doi}: JSON parse error: {e} ({elapsed:.3f}s)", file=sys.stderr)
+            print(f"[STEP2][{worker_id}] PID {pid} DOI {doi}: JSON error {e}")
             return
 
         ftr = data.get("full-text-retrieval-response")
         if not isinstance(ftr, dict):
-            elapsed = time.time() - start
-            print(f"[STEP2][worker {worker_id}] PID {pid} DOI {doi}: no full-text-retrieval-response ({elapsed:.3f}s)")
+            print(f"[STEP2][{worker_id}] PID {pid} DOI {doi}: no full-text-retrieval-response")
             return
 
-        core = ftr.get("coredata")
+        core = ftr.get("coredata") or {}
         if not isinstance(core, dict):
-            elapsed = time.time() - start
-            print(f"[STEP2][worker {worker_id}] PID {pid} DOI {doi}: no coredata ({elapsed:.3f}s)")
+            print(f"[STEP2][{worker_id}] PID {pid} DOI {doi}: no coredata")
             return
 
-        # 1) Authors + OpenAccess
-        authors_list = []
+        # Authors
+        authors = []
         dc_creator = core.get("dc:creator")
         if isinstance(dc_creator, list):
             for item in dc_creator:
                 if isinstance(item, dict):
                     name = item.get("$")
                     if isinstance(name, str) and name.strip():
-                        authors_list.append(name.strip())
+                        authors.append(name.strip())
                 elif isinstance(item, str) and item.strip():
-                    authors_list.append(item.strip())
+                    authors.append(item.strip())
         elif isinstance(dc_creator, str) and dc_creator.strip():
-            authors_list.append(dc_creator.strip())
-
+            authors.append(dc_creator.strip())
         creator = core.get("creator")
-        if not authors_list:
+        if not authors:
             if isinstance(creator, str) and creator.strip():
-                authors_list.append(creator.strip())
+                authors.append(creator.strip())
             elif isinstance(creator, list):
                 for c in creator:
                     if isinstance(c, str) and c.strip():
-                        authors_list.append(c.strip())
-
-        seen = set()
-        uniq = []
-        for a in authors_list:
+                        authors.append(c.strip())
+        uniq_authors, seen = [], set()
+        for a in authors:
             if a and a not in seen:
                 seen.add(a)
-                uniq.append(a)
-        authors_str = "; ".join(uniq)
+                uniq_authors.append(a)
+        authors_str = "; ".join(uniq_authors)
 
+        # Open access
         open_access = False
-        oa_article = core.get("openaccessArticle")
-        oa_flag = core.get("openaccess")
-        if isinstance(oa_article, str) and oa_article.lower() == "true":
+        if str(core.get("openaccessArticle", "")).lower() == "true":
             open_access = True
-        elif isinstance(oa_flag, str) and oa_flag == "1":
+        elif str(core.get("openaccess", "")) == "1":
             open_access = True
 
-        # 2) Data links: regex over the full JSON response
-        files = extract_data_files(content)
-
-        # 3) Map mmcX.xlsx -> Elsevier object URLs when possible
+        # Data links
+        content_text = resp.text
+        files = extract_data_files(content_text)
         objects_section = ftr.get("objects", {}).get("object")
         if objects_section:
             files = map_files_to_elsevier_objects(files, objects_section)
-
-        # 3bis) Normalize Elsevier object URLs (Object Retrieval)
-        normalized_files = []
-        for link in files:
-            if isinstance(link, str) and "api.elsevier.com/content/object/eid/" in link:
-                normalized_files.append(make_elsevier_object_download_url(link))
-            else:
-                normalized_files.append(link)
-        files = normalized_files
-
+        files = [
+            make_elsevier_object_download_url(f)
+            if isinstance(f, str) and "api.elsevier.com/content/object/eid/" in f
+            else f
+            for f in files
+        ]
         has_data = bool(files)
 
-        # 4) Update CLASSIFICATION (Authors, OA, Has_data, DONE=True)
-        update_class_sql = (
-            "UPDATE CLASSIFICATION SET Authors = %s, Open_Access = %s, Has_data = %s, DONE = %s "
-            "WHERE id = %s"
+        # Update CLASSIFICATION
+        cur.execute(
+            "UPDATE CLASSIFICATION SET Authors=%s, Open_Access=%s, Has_data=%s, DONE=%s WHERE id=%s",
+            (authors_str, open_access, has_data, True, pid),
         )
-        try:
-            cur.execute(update_class_sql, (authors_str, open_access, has_data, True, pid))
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            elapsed = time.time() - start
-            print(f"[STEP2][worker {worker_id}] PID {pid} DOI {doi}: error updating CLASSIFICATION: {e} ({elapsed:.3f}s)", file=sys.stderr)
-            return
+        db.commit()
 
-        # 5) Insert into EXTRACTION if we have files
-        if files:
-            insert_extr_sql = (
-                "INSERT INTO EXTRACTION (pid, URL, data_link, done) VALUES (%s, %s, %s, %s)"
+        # EXTRACTION
+        if has_data:
+            cur.executemany(
+                "INSERT INTO EXTRACTION (pid, URL, data_link, done) VALUES (%s, %s, %s, %s)",
+                [(pid, f"https://doi.org/{doi}", link, 0) for link in files],
             )
-            # done = 0 here; verification is done in Step 3
-            ex_rows = [(pid, f"https://doi.org/{doi}", link, 0) for link in files]
-            try:
-                cur.executemany(insert_extr_sql, ex_rows)
-                db.commit()
-            except Exception as e:
-                db.rollback()
-                elapsed = time.time() - start
-                print(f"[STEP2][worker {worker_id}] PID {pid} DOI {doi}: error inserting EXTRACTION: {e} ({elapsed:.3f}s)", file=sys.stderr)
-                return
+            db.commit()
 
-        elapsed = time.time() - start
-        print(f"[STEP2][worker {worker_id}] PID {pid} DOI {doi}: has_data={has_data} in {elapsed:.3f}s")
+        print(f"[STEP2][{worker_id}] PID {pid} DOI {doi}: has_data={has_data} ({time.time()-start:.1f}s)")
 
+    except Exception as e:
+        db.rollback()
+        print(f"[STEP2][{worker_id}] PID {pid} DOI {doi}: ERROR {e}", file=sys.stderr)
     finally:
         cur.close()
         db.close()
@@ -447,19 +311,16 @@ def process_one_paper_step2(row, worker_id: int):
 def step2_extract_data_links():
     db = get_db_connection()
     cur = db.cursor()
-
-    select_sql = "SELECT id, title, DOI, DONE FROM CLASSIFICATION"
-    cur.execute(select_sql)
+    cur.execute("SELECT id, title, DOI, DONE FROM CLASSIFICATION")
     rows = cur.fetchall()
     cur.close()
     db.close()
 
-    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
-        futures = []
-        for idx, row in enumerate(rows):
-            worker_id = idx % NUM_WORKERS
-            futures.append(executor.submit(process_one_paper_step2, row, worker_id))
-
+    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as ex:
+        futures = [
+            ex.submit(process_one_paper_step2, row, idx % NUM_WORKERS)
+            for idx, row in enumerate(rows)
+        ]
         for f in as_completed(futures):
             try:
                 f.result()
@@ -467,67 +328,234 @@ def step2_extract_data_links():
                 print(f"[STEP2] worker error: {e}", file=sys.stderr)
 
 
-# ================== Step 3 ==================
+# ================== STEP 3: vérifier data_link ==================
+
+def is_data_link_downloadable(link: str, session: requests.Session) -> bool:
+    if not isinstance(link, str) or not link.strip():
+        return False
+    if "api.elsevier.com/content/object/eid/" not in link:
+        return False
+    url = make_elsevier_object_download_url(link)
+    resp = http_get_with_retries(session, url, {"X-ELS-APIKey": API_KEY, "Accept": "*/*"})
+    if not resp or resp.status_code != 200:
+        return False
+
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+    clen = resp.headers.get("Content-Length")
+    try:
+        clen_int = int(clen) if clen is not None else None
+    except ValueError:
+        clen_int = None
+    if clen_int is not None and clen_int <= 0:
+        return False
+
+    sample = resp.content[:256]
+
+    if (
+        "application/excel" in ctype
+        or "application/vnd.ms-excel" in ctype
+        or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in ctype
+    ):
+        return bool(sample) and (
+            sample.startswith(b"PK\x03\x04") or sample.startswith(b"\xD0\xCF\x11\xE0")
+        )
+
+    if "text/csv" in ctype or "text/plain" in ctype:
+        text_sample = sample.decode("utf-8", errors="ignore").strip()
+        if not text_sample:
+            return False
+        lower = text_sample.lower()
+        if lower.startswith("<html") or lower.startswith("<!doctype html") or lower.startswith("<service-error"):
+            return False
+        return True
+
+    return False
+
+
+def _process_one_link_step3(row, worker_id: int):
+    pid, link = row
+    db = get_db_connection()
+    cur = db.cursor()
+    session = make_session()
+    try:
+        ok = is_data_link_downloadable(link, session)
+        cur.execute("UPDATE EXTRACTION SET done=%s WHERE pid=%s AND data_link=%s", (int(ok), pid, link))
+        db.commit()
+        print(f"[STEP3][{worker_id}] PID {pid} link {link}: {ok}")
+    except Exception as e:
+        db.rollback()
+        print(f"[STEP3][{worker_id}] PID {pid} link {link}: ERROR {e}", file=sys.stderr)
+    finally:
+        cur.close()
+        db.close()
+
 
 def step3_check_downloadable():
     db = get_db_connection()
     cur = db.cursor()
-    session = requests.Session()
-
-    select_sql = "SELECT pid, data_link FROM EXTRACTION WHERE done = 0"
-    update_sql = "UPDATE EXTRACTION SET done = %s WHERE pid = %s AND data_link = %s"
-
-    cur.execute(select_sql)
+    cur.execute("SELECT pid, data_link FROM EXTRACTION WHERE done = 0")
     rows = cur.fetchall()
-
-    for pid, link in rows:
-        ok = is_data_link_downloadable(link, session)
-        try:
-            cur.execute(update_sql, (int(ok), pid, link))
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            print(f"[STEP3] PID {pid} link {link}: error updating done: {e}", file=sys.stderr)
-        print(f"[STEP3] PID {pid} link {link}: downloadable={ok}")
-
     cur.close()
     db.close()
 
+    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as ex:
+        futures = [
+            ex.submit(_process_one_link_step3, row, idx % NUM_WORKERS)
+            for idx, row in enumerate(rows)
+        ]
+        for f in as_completed(futures):
+            try:
+                f.result()
+            except Exception as e:
+                print(f"[STEP3] worker error: {e}", file=sys.stderr)
+
+
+# ================== STEP 4: Abstract API -> enrich CLASSIFICATION ==================
+
+def fetch_abstract_by_doi(session: requests.Session, doi: str) -> dict | None:
+    if not API_KEY:
+        return None
+    url = "https://api.elsevier.com/content/abstract/doi/" + urllib.parse.quote(doi)
+    resp = http_get_with_retries(session, url, {"X-ELS-APIKey": API_KEY, "Accept": "application/json"})
+    if not resp:
+        return None
+    try:
+        return resp.json()
+    except Exception:
+        return None
+
+
+def extract_countries_from_abstract(data: dict) -> list[str]:
+    countries: set[str] = set()
+    arr = data.get("abstracts-retrieval-response") or {}
+    item = arr.get("item") or {}
+    bib = item.get("bibrecord") or {}
+    head = bib.get("head") or {}
+    ag = head.get("author-group") or []
+    if isinstance(ag, dict):
+        ag = [ag]
+    for g in ag:
+        aff = g.get("affiliation") or {}
+        if isinstance(aff, dict):
+            aff = [aff]
+        for a in aff:
+            c = a.get("country")
+            if isinstance(c, str) and c.strip():
+                countries.add(c.strip())
+    return sorted(countries)
+
+
+def extract_organizations_from_abstract(data: dict) -> list[str]:
+    orgs: set[str] = set()
+    arr = data.get("abstracts-retrieval-response") or {}
+    item = arr.get("item") or {}
+    bib = item.get("bibrecord") or {}
+    head = bib.get("head") or {}
+    ag = head.get("author-group") or []
+    if isinstance(ag, dict):
+        ag = [ag]
+    for g in ag:
+        aff = g.get("affiliation") or {}
+        if isinstance(aff, dict):
+            aff = [aff]
+        for a in aff:
+            org_list = a.get("organization") or []
+            if isinstance(org_list, dict):
+                org_list = [org_list]
+            for o in org_list:
+                if isinstance(o, dict):
+                    name = o.get("$")
+                    if isinstance(name, str) and name.strip():
+                        orgs.add(name.strip())
+    return sorted(orgs)
+
+
+def extract_publication_year_from_abstract(data: dict) -> int | None:
+    arr = data.get("abstracts-retrieval-response") or {}
+    item = arr.get("item") or {}
+    bib = item.get("bibrecord") or {}
+    head = bib.get("head") or {}
+    source = head.get("source") or {}
+    pubdate = source.get("publicationdate") or {}
+    year_str = pubdate.get("year")
+    if isinstance(year_str, str) and year_str.isdigit():
+        return int(year_str)
+    return None
+
+
+def _process_one_paper_step4(row, worker_id: int):
+    pid, doi = row
+    if not doi:
+        return
+    db = get_db_connection()
+    cur = db.cursor()
+    session = make_session()
+    try:
+        data = fetch_abstract_by_doi(session, doi)
+        if not data:
+            return
+        year = extract_publication_year_from_abstract(data)
+        countries = extract_countries_from_abstract(data)
+        orgs = extract_organizations_from_abstract(data)
+        country_str = "; ".join(countries) if countries else None
+        org_str = "; ".join(orgs) if orgs else None
+
+        cur.execute(
+            "UPDATE CLASSIFICATION SET Year=%s, Country=%s, Organization=%s WHERE id=%s",
+            (year, country_str, org_str, pid),
+        )
+        db.commit()
+        print(f"[STEP4][{worker_id}] PID {pid} DOI {doi}")
+    except Exception as e:
+        db.rollback()
+        print(f"[STEP4][{worker_id}] PID {pid} DOI {doi}: ERROR {e}", file=sys.stderr)
+    finally:
+        cur.close()
+        db.close()
+
+
+def step4_enrich_with_abstract():
+    db = get_db_connection()
+    cur = db.cursor()
+    cur.execute("SELECT id, DOI FROM CLASSIFICATION")
+    rows = cur.fetchall()
+    cur.close()
+    db.close()
+
+    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as ex:
+        futures = [
+            ex.submit(_process_one_paper_step4, row, idx % NUM_WORKERS)
+            for idx, row in enumerate(rows)
+        ]
+        for f in as_completed(futures):
+            try:
+                f.result()
+            except Exception as e:
+                print(f"[STEP4] worker error: {e}", file=sys.stderr)
+
+
+# ================== Main ==================
 
 def main():
     try:
-        print("=== STEP 1: load CLASSIFICATION from JSON ===")
+        print("=== STEP 1 ===")
         step1_load_classification()
-        print("=== STEP 2: extract data links into EXTRACTION (multithread, workers logged) ===")
+        print("=== STEP 2 ===")
         step2_extract_data_links()
-        print("=== STEP 3: check which data_link are downloadable (Elsevier Excel/CSV only) ===")
+        print("=== STEP 3 ===")
         step3_check_downloadable()
+        print("=== STEP 4 ===")
+        step4_enrich_with_abstract()
         print("=== ALL STEPS DONE ===")
     except KeyboardInterrupt:
-        print("\nKeyboard interrupt detected.", file=sys.stderr)
-        if CURRENT_PAPER is not None:
-            print(
-                "Last paper in progress:\n"
-                f"  PID      : {CURRENT_PAPER.get('pid')}\n"
-                f"  DOI      : {CURRENT_PAPER.get('doi')}\n"
-                f"  Title    : {CURRENT_PAPER.get('title')}\n"
-                f"  Worker   : {CURRENT_PAPER.get('worker')}",
-                file=sys.stderr,
-            )
-        else:
-            print("No paper had started yet.", file=sys.stderr)
+        print("\nKeyboard interrupt.", file=sys.stderr)
+        if CURRENT_PAPER:
+            print(f"Last paper: {CURRENT_PAPER}", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         print(f"\nFatal error: {e}", file=sys.stderr)
-        if CURRENT_PAPER is not None:
-            print(
-                "Last paper in progress:\n"
-                f"  PID      : {CURRENT_PAPER.get('pid')}\n"
-                f"  DOI      : {CURRENT_PAPER.get('doi')}\n"
-                f"  Title    : {CURRENT_PAPER.get('title')}\n"
-                f"  Worker   : {CURRENT_PAPER.get('worker')}",
-                file=sys.stderr,
-            )
+        if CURRENT_PAPER:
+            print(f"Last paper: {CURRENT_PAPER}", file=sys.stderr)
         raise
 
 

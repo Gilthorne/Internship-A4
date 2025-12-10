@@ -53,7 +53,7 @@ def http_get_with_retries(session: requests.Session, url: str, headers: dict, ma
             if 500 <= r.status_code < 600:
                 last_err = requests.HTTPError(f"HTTP {r.status_code}")
                 if attempt < max_retries:
-                    time.sleep(2)
+                    time.sleep(2*attempt)
                     continue
                 break
             r.raise_for_status()

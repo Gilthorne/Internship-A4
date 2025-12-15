@@ -4,8 +4,7 @@ import json
 import re
 import sys
 import time
-import urllib.parse
-from urllib.parse import urlparse, urlencode, urlunparse, parse_qsl
+from urllib.parse import urlparse, urlencode, urlunparse, parse_qsl, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import mysql.connector as sql
@@ -38,7 +37,7 @@ def get_db_connection():
 def extract_doi_from_link(doi_link: str) -> str | None:
     if not doi_link:
         return None
-    parsed = urllib.parse.urlparse(doi_link)
+    parsed = urlparse(doi_link)
     path = parsed.path.lstrip("/")
     if path:
         return path
@@ -52,7 +51,7 @@ def http_get_with_retries(session: requests.Session, url: str, headers: dict, ma
     last_err = None
     for attempt in range(1, max_retries + 1):
         try:
-            r = session.get(url, headers=headers)
+            r = session.get(url, headers=headers, timeout=30)
             if 500 <= r.status_code < 600:
                 last_err = requests.HTTPError(f"HTTP {r.status_code}")
                 if attempt < max_retries:
@@ -89,6 +88,53 @@ def detect_source_website(link: str) -> str:
     if "api.elsevier.com" in low or "elsevier.com" in low:
         return "elsevier"
     return "other"
+
+
+# ================== Common Elsevier helpers ==================
+
+def fetch_elsevier_json(endpoint: str, doi: str, session: requests.Session) -> dict | None:
+    """endpoint: 'article' ou 'abstract'."""
+    if not API_KEY or not doi:
+        return None
+    url = f"https://api.elsevier.com/content/{endpoint}/doi/" + quote(doi)
+    resp = http_get_with_retries(session, url, {"X-ELS-APIKey": API_KEY, "Accept": "application/json"})
+    if not resp:
+        return None
+    try:
+        return resp.json()
+    except Exception:
+        return None
+
+
+def parse_authors_from_coredata(core: dict) -> str:
+    authors = []
+    dc_creator = core.get("dc:creator")
+    if isinstance(dc_creator, list):
+        for item in dc_creator:
+            if isinstance(item, dict):
+                name = item.get("$")
+                if isinstance(name, str) and name.strip():
+                    authors.append(name.strip())
+            elif isinstance(item, str) and item.strip():
+                authors.append(item.strip())
+    elif isinstance(dc_creator, str) and dc_creator.strip():
+        authors.append(dc_creator.strip())
+
+    creator = core.get("creator")
+    if not authors:
+        if isinstance(creator, str) and creator.strip():
+            authors.append(creator.strip())
+        elif isinstance(creator, list):
+            for c in creator:
+                if isinstance(c, str) and c.strip():
+                    authors.append(c.strip())
+
+    uniq, seen = [], set()
+    for a in authors:
+        if a and a not in seen:
+            seen.add(a)
+            uniq.append(a)
+    return "; ".join(uniq)
 
 
 # ================== STEP 1: JSON -> CLASSIFICATION ==================
@@ -133,20 +179,7 @@ def step1_load_classification():
     db.close()
 
 
-# ================== STEP 2 (ancien STEP 4): Abstract API -> enrich CLASSIFICATION ==================
-
-def fetch_abstract_by_doi(session: requests.Session, doi: str) -> dict | None:
-    if not API_KEY:
-        return None
-    url = "https://api.elsevier.com/content/abstract/doi/" + urllib.parse.quote(doi)
-    resp = http_get_with_retries(session, url, {"X-ELS-APIKey": API_KEY, "Accept": "application/json"})
-    if not resp:
-        return None
-    try:
-        return resp.json()
-    except Exception:
-        return None
-
+# ================== STEP 2: Abstract API -> enrich CLASSIFICATION ==================
 
 def extract_countries_from_abstract(data: dict) -> list[str]:
     countries: set[str] = set()
@@ -210,16 +243,19 @@ def _process_one_paper_step2(row, worker_id: int):
     pid, doi = row
     if not doi:
         return
+
     db = get_db_connection()
     cur = db.cursor()
     session = make_session()
+
     try:
-        data = fetch_abstract_by_doi(session, doi)
+        data = fetch_elsevier_json("abstract", doi, session)
         if not data:
             return
         year = extract_publication_year_from_abstract(data)
         countries = extract_countries_from_abstract(data)
         orgs = extract_organizations_from_abstract(data)
+
         country_str = "; ".join(countries) if countries else None
         org_str = "; ".join(orgs) if orgs else None
 
@@ -257,7 +293,7 @@ def step2_enrich_with_abstract():
                 print(f"[STEP2] worker error: {e}", file=sys.stderr)
 
 
-# ================== STEP 3 (ancien STEP 2): Article API -> EXTRACTION ==================
+# ================== STEP 3: Article API -> EXTRACTION ==================
 
 PATTERNS = [
     r"\b\w+\.csv\b",
@@ -444,10 +480,7 @@ def github_data_files_from_link(link: str):
         if e.get("type") == "blob" and e.get("path", "").lower().endswith(exts)
     ]
 
-    out = []
-    for p in data_paths:
-        out.append(f"https://github.com/{owner}/{repo}/blob/{ref}/{p}")
-    return out
+    return [f"https://github.com/{owner}/{repo}/blob/{ref}/{p}" for p in data_paths]
 
 
 def process_one_paper_step3(row, worker_id: int):
@@ -465,20 +498,9 @@ def process_one_paper_step3(row, worker_id: int):
             print(f"[STEP3][{worker_id}] PID {pid} DOI {doi}: DONE, skip")
             return
 
-        if not API_KEY:
-            print("[STEP3] ELSEVIER_API_KEY missing", file=sys.stderr)
-            return
-
-        url = "https://api.elsevier.com/content/article/doi/" + urllib.parse.quote(doi)
-        resp = http_get_with_retries(session, url, {"X-ELS-APIKey": API_KEY, "Accept": "application/json"})
-        if not resp:
+        data = fetch_elsevier_json("article", doi, session)
+        if not data:
             print(f"[STEP3][{worker_id}] PID {pid} DOI {doi}: no response")
-            return
-
-        try:
-            data = resp.json()
-        except Exception as e:
-            print(f"[STEP3][{worker_id}] PID {pid} DOI {doi}: JSON error {e}")
             return
 
         ftr = data.get("full-text-retrieval-response")
@@ -491,43 +513,19 @@ def process_one_paper_step3(row, worker_id: int):
             print(f"[STEP3][{worker_id}] PID {pid} DOI {doi}: no coredata")
             return
 
-        # Authors
-        authors = []
-        dc_creator = core.get("dc:creator")
-        if isinstance(dc_creator, list):
-            for item in dc_creator:
-                if isinstance(item, dict):
-                    name = item.get("$")
-                    if isinstance(name, str) and name.strip():
-                        authors.append(name.strip())
-                elif isinstance(item, str) and item.strip():
-                    authors.append(item.strip())
-        elif isinstance(dc_creator, str) and dc_creator.strip():
-            authors.append(dc_creator.strip())
-        creator = core.get("creator")
-        if not authors:
-            if isinstance(creator, str) and creator.strip():
-                authors.append(creator.strip())
-            elif isinstance(creator, list):
-                for c in creator:
-                    if isinstance(c, str) and c.strip():
-                        authors.append(c.strip())
-        uniq_authors, seen = [], set()
-        for a in authors:
-            if a and a not in seen:
-                seen.add(a)
-                uniq_authors.append(a)
-        authors_str = "; ".join(uniq_authors)
-
-        # Open access
-        open_access = False
-        if str(core.get("openaccessArticle", "")).lower() == "true":
-            open_access = True
-        elif str(core.get("openaccess", "")) == "1":
-            open_access = True
+        # Authors & Open access
+        authors_str = parse_authors_from_coredata(core)
+        open_access = (
+            str(core.get("openaccessArticle", "")).lower() == "true"
+            or str(core.get("openaccess", "")) == "1"
+        )
 
         # Extraction des liens dans le texte
-        content_text = resp.text
+        content_text = session.get(  # on réutilise le texte brut
+            f"https://api.elsevier.com/content/article/doi/{quote(doi)}",
+            headers={"X-ELS-APIKey": API_KEY, "Accept": "application/json"},
+            timeout=30,
+        ).text
         links = extract_data_files(content_text)
 
         # Map mmcX.* vers objets Elsevier
@@ -544,7 +542,7 @@ def process_one_paper_step3(row, worker_id: int):
         ]
 
         # Séparation data-links / autres (sert à Has_data uniquement)
-        data_files, other_links = split_data_vs_other_links(links)
+        data_files, _ = split_data_vs_other_links(links)
         has_data = bool(data_files)
 
         # Construction des lignes pour EXTRACTION: logique par source
@@ -570,10 +568,7 @@ def process_one_paper_step3(row, worker_id: int):
                 else:
                     rows_to_insert.append((pid, base_url, src, l, False))
 
-            elif src == "mendeley":
-                rows_to_insert.append((pid, base_url, src, l, False))
-
-            else:
+            else:  # mendeley, elsevier, other
                 rows_to_insert.append((pid, base_url, src, l, False))
 
         # Update CLASSIFICATION
@@ -628,7 +623,7 @@ def is_data_link_downloadable(link: str, source: str, session: requests.Session)
     if not isinstance(link, str) or not link.strip():
         return False
 
-    # ----- Cas Elsevier: comme avant -----
+    # Elsevier objects
     if source == "elsevier" and "api.elsevier.com/content/object/eid/" in link:
         url = make_elsevier_object_download_url(link)
         resp = http_get_with_retries(session, url, {"X-ELS-APIKey": API_KEY, "Accept": "*/*"})
@@ -666,37 +661,28 @@ def is_data_link_downloadable(link: str, source: str, session: requests.Session)
 
         return False
 
-    # ----- Cas Zenodo: liens de download directs (.csv/.xls/.xlsx/.json) -----
+    # Zenodo
     if source == "zenodo":
         try:
             resp = session.get(link, timeout=20)
         except Exception:
             return False
-
         if resp.status_code != 200:
             return False
-
         ctype = (resp.headers.get("Content-Type") or "").lower()
         if "text/html" in ctype:
             return False
+        return bool(resp.content)
 
-        if resp.content:
-            return True
-        return False
-
-    # ----- Cas GitHub: on teste juste que l'URL répond correctement -----
+    # GitHub
     if source == "github":
         try:
             resp = session.get(link, timeout=20)
         except Exception:
             return False
+        return resp.status_code == 200
 
-        if resp.status_code != 200:
-            return False
-
-        return True
-
-    # ----- Autres sources (mendeley, other...) : pas testés pour l'instant -----
+    # autres (mendeley, other) : pas testés
     return False
 
 

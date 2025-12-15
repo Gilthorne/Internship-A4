@@ -148,6 +148,20 @@ def extract_data_files(text: str):
             out.append(x)
     return out
 
+def split_data_vs_other_links(links):
+    exts = (".csv", ".xls", ".xlsx", ".json")
+    data_files = []
+    other_links = []
+    for link in links:
+        if not isinstance(link, str):
+            other_links.append(link)
+            continue
+        low = link.lower()
+        if any(low.endswith(ext) for ext in exts):
+            data_files.append(link)
+        else:
+            other_links.append(link)
+    return data_files, other_links
 
 def map_files_to_elsevier_objects(files, objects_section):
     import os
@@ -269,19 +283,27 @@ def process_one_paper_step2(row, worker_id: int):
         elif str(core.get("openaccess", "")) == "1":
             open_access = True
 
-        # Data links
         content_text = resp.text
-        files = extract_data_files(content_text)
+        links = extract_data_files(content_text) 
+
         objects_section = ftr.get("objects", {}).get("object")
         if objects_section:
-            files = map_files_to_elsevier_objects(files, objects_section)
-        files = [
-            make_elsevier_object_download_url(f)
-            if isinstance(f, str) and "api.elsevier.com/content/object/eid/" in f
-            else f
-            for f in files
+            links = map_files_to_elsevier_objects(links, objects_section)
+
+        links = [
+            make_elsevier_object_download_url(l)
+            if isinstance(l, str) and "api.elsevier.com/content/object/eid/" in l
+            else l
+            for l in links
         ]
-        has_data = bool(files)
+
+        data_files, other_links = split_data_vs_other_links(links)
+        if data_files:
+            final_links = data_files
+        else:
+            final_links = other_links
+
+        has_data = bool(data_files)
 
         # Update CLASSIFICATION
         cur.execute(
@@ -291,12 +313,13 @@ def process_one_paper_step2(row, worker_id: int):
         db.commit()
 
         # EXTRACTION
-        if has_data:
+        if final_links:
             cur.executemany(
                 "INSERT INTO EXTRACTION (pid, URL, data_link, done) VALUES (%s, %s, %s, %s)",
-                [(pid, f"https://doi.org/{doi}", link, 0) for link in files],
+                [(pid, f"https://doi.org/{doi}", link, 0) for link in final_links],
             )
             db.commit()
+
 
         print(f"[STEP2][{worker_id}] PID {pid} DOI {doi}: has_data={has_data} ({time.time()-start:.1f}s)")
 

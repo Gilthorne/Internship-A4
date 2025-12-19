@@ -90,6 +90,24 @@ def detect_source_website(link: str) -> str:
     return "other"
 
 
+def print_progress(prefix: str, current: int, total: int, bar_width: int = 50):
+    if total <= 0:
+        bar = "-" * bar_width
+        msg = f"{prefix} [{bar}] {current}/? (0.0%)"
+    else:
+        ratio = max(0.0, min(1.0, current / total))
+        filled = int(bar_width * ratio)
+        bar = "#" * filled + "-" * (bar_width - filled)
+        pct = 100.0 * ratio
+        msg = f"{prefix} [{bar}] {current}/{total} ({pct:.1f}%)"
+
+    sys.stdout.write("\r" + msg)
+    sys.stdout.flush()
+    if total > 0 and current >= total:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
 # ================== Common Elsevier helpers ==================
 
 def fetch_elsevier_json(endpoint: str, doi: str, session: requests.Session) -> dict | None:
@@ -148,6 +166,8 @@ def step1_load_classification():
         return
 
     entries = [e for e in links if e.get("doi_link")]
+    total = len(entries)
+    done = 0
 
     db = get_db_connection()
     cur = db.cursor()
@@ -162,18 +182,21 @@ def step1_load_classification():
         doi = extract_doi_from_link(entry.get("doi_link"))
         title = entry.get("title") or "N/A"
         if not doi:
+            done += 1
+            print_progress("[STEP 1] Processing DOIs", done, total)
             continue
 
         try:
             cur.execute(select_sql, (doi,))
-            if cur.fetchone():
-                continue
-            cur.execute(insert_sql, (title, "", doi, False, False, False))
-            db.commit()
-            print(f"[STEP1] Inserted {doi}")
+            if not cur.fetchone():
+                cur.execute(insert_sql, (title, "", doi, False, False, False))
+                db.commit()
         except Exception as e:
             db.rollback()
             print(f"[STEP1] Error inserting {doi}: {e}", file=sys.stderr)
+
+        done += 1
+        print_progress("[STEP 1] Processing DOIs", done, total)
 
     cur.close()
     db.close()
@@ -239,9 +262,12 @@ def extract_publication_year_from_abstract(data: dict) -> int | None:
     return None
 
 
-def _process_one_paper_step2(row, worker_id: int):
+def _process_one_paper_step2(row, worker_id: int, total: int, counter: dict):
     pid, doi = row
     if not doi:
+        # even if doi is missing, we still advance progress
+        counter["done"] += 1
+        print_progress("[STEP 2] Enriching abstracts", counter["done"], total)
         return
 
     db = get_db_connection()
@@ -250,27 +276,27 @@ def _process_one_paper_step2(row, worker_id: int):
 
     try:
         data = fetch_elsevier_json("abstract", doi, session)
-        if not data:
-            return
-        year = extract_publication_year_from_abstract(data)
-        countries = extract_countries_from_abstract(data)
-        orgs = extract_organizations_from_abstract(data)
+        if data:
+            year = extract_publication_year_from_abstract(data)
+            countries = extract_countries_from_abstract(data)
+            orgs = extract_organizations_from_abstract(data)
 
-        country_str = "; ".join(countries) if countries else None
-        org_str = "; ".join(orgs) if orgs else None
+            country_str = "; ".join(countries) if countries else None
+            org_str = "; ".join(orgs) if orgs else None
 
-        cur.execute(
-            "UPDATE CLASSIFICATION SET Year=%s, Country=%s, Organization=%s WHERE id=%s",
-            (year, country_str, org_str, pid),
-        )
-        db.commit()
-        print(f"[STEP2][{worker_id}] PID {pid} DOI {doi}")
+            cur.execute(
+                "UPDATE CLASSIFICATION SET Year=%s, Country=%s, Organization=%s WHERE id=%s",
+                (year, country_str, org_str, pid),
+            )
+            db.commit()
     except Exception as e:
         db.rollback()
-        print(f"[STEP2][{worker_id}] PID {pid} DOI {doi}: ERROR {e}", file=sys.stderr)
+        print(f"[STEP2] PID {pid} DOI {doi}: ERROR {e}", file=sys.stderr)
     finally:
         cur.close()
         db.close()
+        counter["done"] += 1
+        print_progress("[STEP 2] Enriching abstracts", counter["done"], total)
 
 
 def step2_enrich_with_abstract():
@@ -281,9 +307,12 @@ def step2_enrich_with_abstract():
     cur.close()
     db.close()
 
+    total = len(rows)
+    counter = {"done": 0}
+
     with ThreadPoolExecutor(max_workers=NUM_WORKERS) as ex:
         futures = [
-            ex.submit(_process_one_paper_step2, row, idx % NUM_WORKERS)
+            ex.submit(_process_one_paper_step2, row, idx % NUM_WORKERS, total, counter)
             for idx, row in enumerate(rows)
         ]
         for f in as_completed(futures):
@@ -483,10 +512,9 @@ def github_data_files_from_link(link: str):
     return [f"https://github.com/{owner}/{repo}/blob/{ref}/{p}" for p in data_paths]
 
 
-def process_one_paper_step3(row, worker_id: int):
+def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict):
     global CURRENT_PAPER
-    pid, title, doi, done = row
-    start = time.time()
+    pid, title, doi, done_flag = row
     CURRENT_PAPER = {"pid": pid, "doi": doi, "title": title, "worker": worker_id}
 
     db = get_db_connection()
@@ -494,23 +522,19 @@ def process_one_paper_step3(row, worker_id: int):
     session = make_session()
 
     try:
-        if done:
-            print(f"[STEP3][{worker_id}] PID {pid} DOI {doi}: DONE, skip")
+        if done_flag:
+            # déjà marqué DONE, on avance juste la barre de progression
             return
-
         data = fetch_elsevier_json("article", doi, session)
         if not data:
-            print(f"[STEP3][{worker_id}] PID {pid} DOI {doi}: no response")
             return
 
         ftr = data.get("full-text-retrieval-response")
         if not isinstance(ftr, dict):
-            print(f"[STEP3][{worker_id}] PID {pid} DOI {doi}: no full-text-retrieval-response")
             return
 
         core = ftr.get("coredata") or {}
         if not isinstance(core, dict):
-            print(f"[STEP3][{worker_id}] PID {pid} DOI {doi}: no coredata")
             return
 
         # Authors & Open access
@@ -521,12 +545,16 @@ def process_one_paper_step3(row, worker_id: int):
         )
 
         # Extraction des liens dans le texte
-        content_text = session.get(  # on réutilise le texte brut
+        # (on réutilise le même endpoint, mais on prend le texte brut)
+        article_resp = http_get_with_retries(
+            session,
             f"https://api.elsevier.com/content/article/doi/{quote(doi)}",
-            headers={"X-ELS-APIKey": API_KEY, "Accept": "application/json"},
-            timeout=30,
-        ).text
-        links = extract_data_files(content_text)
+            {"X-ELS-APIKey": API_KEY, "Accept": "application/json"},
+        )
+        if not article_resp:
+            links = []
+        else:
+            links = extract_data_files(article_resp.text)
 
         # Map mmcX.* vers objets Elsevier
         objects_section = ftr.get("objects", {}).get("object")
@@ -587,14 +615,14 @@ def process_one_paper_step3(row, worker_id: int):
             )
             db.commit()
 
-        print(f"[STEP3][{worker_id}] PID {pid} DOI {doi}: has_data={has_data} ({time.time() - start:.1f}s)")
-
     except Exception as e:
         db.rollback()
-        print(f"[STEP3][{worker_id}] PID {pid} DOI {doi}: ERROR {e}", file=sys.stderr)
+        print(f"[STEP3] PID {pid} DOI {doi}: ERROR {e}", file=sys.stderr)
     finally:
         cur.close()
         db.close()
+        counter["done"] += 1
+        print_progress("[STEP 3] Extracting data links", counter["done"], total)
 
 
 def step3_extract_data_links():
@@ -605,9 +633,12 @@ def step3_extract_data_links():
     cur.close()
     db.close()
 
+    total = len(rows)
+    counter = {"done": 0}
+
     with ThreadPoolExecutor(max_workers=NUM_WORKERS) as ex:
         futures = [
-            ex.submit(process_one_paper_step3, row, idx % NUM_WORKERS)
+            ex.submit(_process_one_paper_step3, row, idx % NUM_WORKERS, total, counter)
             for idx, row in enumerate(rows)
         ]
         for f in as_completed(futures):
@@ -686,7 +717,7 @@ def is_data_link_downloadable(link: str, source: str, session: requests.Session)
     return False
 
 
-def _process_one_link_step4(row, worker_id: int):
+def _process_one_link_step4(row, worker_id: int, total: int, counter: dict):
     pid, link, source = row
     db = get_db_connection()
     cur = db.cursor()
@@ -698,13 +729,14 @@ def _process_one_link_step4(row, worker_id: int):
             (int(ok), pid, link),
         )
         db.commit()
-        print(f"[STEP4][{worker_id}] PID {pid} source {source} link {link}: {ok}")
     except Exception as e:
         db.rollback()
-        print(f"[STEP4][{worker_id}] PID {pid} link {link}: ERROR {e}", file=sys.stderr)
+        print(f"[STEP4] PID {pid} link {link}: ERROR {e}", file=sys.stderr)
     finally:
         cur.close()
         db.close()
+        counter["done"] += 1
+        print_progress("[STEP 4] Checking downloads", counter["done"], total)
 
 
 def step4_check_downloadable():
@@ -715,9 +747,12 @@ def step4_check_downloadable():
     cur.close()
     db.close()
 
+    total = len(rows)
+    counter = {"done": 0}
+
     with ThreadPoolExecutor(max_workers=NUM_WORKERS) as ex:
         futures = [
-            ex.submit(_process_one_link_step4, row, idx % NUM_WORKERS)
+            ex.submit(_process_one_link_step4, row, idx % NUM_WORKERS, total, counter)
             for idx, row in enumerate(rows)
         ]
         for f in as_completed(futures):

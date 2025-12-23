@@ -4,6 +4,8 @@ import json
 import re
 import sys
 import time
+import logging
+from logging.handlers import RotatingFileHandler
 from urllib.parse import urlparse, urlencode, urlunparse, parse_qsl, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -20,7 +22,29 @@ NUM_WORKERS = 4
 CURRENT_PAPER = None
 
 GITHUB_API = "https://api.github.com"
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # optionnel
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # optional
+
+def setup_logging(level=logging.INFO, log_file="pipeline.log", err_file="pipeline.error.log"):
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    root.handlers.clear()
+    root.propagate = False
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    h1 = RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+    h1.setLevel(level)
+    h1.setFormatter(fmt)
+
+    h2 = RotatingFileHandler(err_file, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+    h2.setLevel(logging.ERROR)
+    h2.setFormatter(fmt)
+
+    root.addHandler(h1)
+    root.addHandler(h2)
+    return logging.getLogger(__name__)
+
+logger = setup_logging(level=logging.INFO)
 
 # ================== Utils ==================
 
@@ -63,11 +87,15 @@ def http_get_with_retries(session: requests.Session, url: str, headers: dict, ma
         except requests.HTTPError as e:
             last_err = e
             if not (e.response is not None and 500 <= e.response.status_code < 600):
+                logger.error("HTTP error for %s: %s", url, e, exc_info=True)
                 return None
         except Exception as e:
             last_err = e
+            logger.error("Request failed for %s: %s", url, e, exc_info=True)
             return None
-    print(f"[HTTP] {url}: giving up after retries ({last_err})", file=sys.stderr)
+    msg = f"[HTTP] {url}: giving up after retries ({last_err})"
+    print(msg, file=sys.stderr)
+    logger.error(msg)
     return None
 
 
@@ -111,7 +139,6 @@ def print_progress(prefix: str, current: int, total: int, bar_width: int = 50):
 # ================== Common Elsevier helpers ==================
 
 def fetch_elsevier_json(endpoint: str, doi: str, session: requests.Session) -> dict | None:
-    """endpoint: 'article' ou 'abstract'."""
     if not API_KEY or not doi:
         return None
     url = f"https://api.elsevier.com/content/{endpoint}/doi/" + quote(doi)
@@ -120,7 +147,8 @@ def fetch_elsevier_json(endpoint: str, doi: str, session: requests.Session) -> d
         return None
     try:
         return resp.json()
-    except Exception:
+    except Exception as e:
+        logger.error("JSON decode failed for %s DOI %s: %s", endpoint, doi, e, exc_info=True)
         return None
 
 
@@ -163,6 +191,7 @@ def step1_load_classification():
             links = json.load(f)
     except Exception as e:
         print(f"[STEP1] cannot read {JSON_PATH}: {e}", file=sys.stderr)
+        logger.error("[STEP1] cannot read %s: %s", JSON_PATH, e, exc_info=True)
         return
 
     entries = [e for e in links if e.get("doi_link")]
@@ -194,6 +223,7 @@ def step1_load_classification():
         except Exception as e:
             db.rollback()
             print(f"[STEP1] Error inserting {doi}: {e}", file=sys.stderr)
+            logger.error("[STEP1] Error inserting %s: %s", doi, e, exc_info=True)
 
         done += 1
         print_progress("[STEP 1] Processing DOIs", done, total)
@@ -265,7 +295,6 @@ def extract_publication_year_from_abstract(data: dict) -> int | None:
 def _process_one_paper_step2(row, worker_id: int, total: int, counter: dict):
     pid, doi = row
     if not doi:
-        # even if doi is missing, we still advance progress
         counter["done"] += 1
         print_progress("[STEP 2] Enriching abstracts", counter["done"], total)
         return
@@ -292,6 +321,7 @@ def _process_one_paper_step2(row, worker_id: int, total: int, counter: dict):
     except Exception as e:
         db.rollback()
         print(f"[STEP2] PID {pid} DOI {doi}: ERROR {e}", file=sys.stderr)
+        logger.error("[STEP2] PID %s DOI %s: %s", pid, doi, e, exc_info=True)
     finally:
         cur.close()
         db.close()
@@ -320,6 +350,7 @@ def step2_enrich_with_abstract():
                 f.result()
             except Exception as e:
                 print(f"[STEP2] worker error: {e}", file=sys.stderr)
+                logger.error("[STEP2] worker error: %s", e, exc_info=True)
 
 
 # ================== STEP 3: Article API -> EXTRACTION ==================
@@ -447,7 +478,8 @@ def zenodo_data_files_from_link(link: str):
     try:
         r = requests.get(f"https://zenodo.org/api/records/{rec_id}", timeout=20)
         r.raise_for_status()
-    except Exception:
+    except Exception as e:
+        logger.error("Zenodo record fetch failed: %s (%s)", link, e, exc_info=True)
         return []
 
     exts = (".csv", ".xls", ".xlsx", ".json")
@@ -500,7 +532,8 @@ def github_data_files_from_link(link: str):
         repo_info = gh_get(f"/repos/{owner}/{repo}")
         ref = repo_info.get("default_branch", "main")
         tree = gh_get(f"/repos/{owner}/{repo}/git/trees/{ref}", params={"recursive": "1"})
-    except Exception:
+    except Exception as e:
+        logger.error("GitHub listing failed: %s (%s)", link, e, exc_info=True)
         return []
 
     exts = (".csv", ".xls", ".xlsx", ".json")
@@ -523,7 +556,6 @@ def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict):
 
     try:
         if done_flag:
-            # déjà marqué DONE, on avance juste la barre de progression
             return
         data = fetch_elsevier_json("article", doi, session)
         if not data:
@@ -537,15 +569,12 @@ def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict):
         if not isinstance(core, dict):
             return
 
-        # Authors & Open access
         authors_str = parse_authors_from_coredata(core)
         open_access = (
             str(core.get("openaccessArticle", "")).lower() == "true"
             or str(core.get("openaccess", "")) == "1"
         )
 
-        # Extraction des liens dans le texte
-        # (on réutilise le même endpoint, mais on prend le texte brut)
         article_resp = http_get_with_retries(
             session,
             f"https://api.elsevier.com/content/article/doi/{quote(doi)}",
@@ -556,12 +585,10 @@ def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict):
         else:
             links = extract_data_files(article_resp.text)
 
-        # Map mmcX.* vers objets Elsevier
         objects_section = ftr.get("objects", {}).get("object")
         if objects_section:
             links = map_files_to_elsevier_objects(links, objects_section)
 
-        # Normaliser les objets Elsevier (Object Retrieval)
         links = [
             make_elsevier_object_download_url(l)
             if isinstance(l, str) and "api.elsevier.com/content/object/eid/" in l
@@ -569,11 +596,9 @@ def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict):
             for l in links
         ]
 
-        # Séparation data-links / autres (sert à Has_data uniquement)
         data_files, _ = split_data_vs_other_links(links)
         has_data = bool(data_files)
 
-        # Construction des lignes pour EXTRACTION: logique par source
         base_url = f"https://doi.org/{doi}"
         rows_to_insert = []
 
@@ -596,17 +621,15 @@ def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict):
                 else:
                     rows_to_insert.append((pid, base_url, src, l, False))
 
-            else:  # mendeley, elsevier, other
+            else:
                 rows_to_insert.append((pid, base_url, src, l, False))
 
-        # Update CLASSIFICATION
         cur.execute(
             "UPDATE CLASSIFICATION SET Authors=%s, Open_Access=%s, Has_data=%s, DONE=%s WHERE id=%s",
             (authors_str, open_access, has_data, True, pid),
         )
         db.commit()
 
-        # EXTRACTION
         if rows_to_insert:
             cur.executemany(
                 "INSERT INTO EXTRACTION (pid, URL, source_website, data_link, done) "
@@ -618,6 +641,7 @@ def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict):
     except Exception as e:
         db.rollback()
         print(f"[STEP3] PID {pid} DOI {doi}: ERROR {e}", file=sys.stderr)
+        logger.error("[STEP3] PID %s DOI %s: %s", pid, doi, e, exc_info=True)
     finally:
         cur.close()
         db.close()
@@ -646,6 +670,7 @@ def step3_extract_data_links():
                 f.result()
             except Exception as e:
                 print(f"[STEP3] worker error: {e}", file=sys.stderr)
+                logger.error("[STEP3] worker error: %s", e, exc_info=True)
 
 
 # ================== STEP 4: verify data_link ==================
@@ -654,7 +679,6 @@ def is_data_link_downloadable(link: str, source: str, session: requests.Session)
     if not isinstance(link, str) or not link.strip():
         return False
 
-    # Elsevier objects
     if source == "elsevier" and "api.elsevier.com/content/object/eid/" in link:
         url = make_elsevier_object_download_url(link)
         resp = http_get_with_retries(session, url, {"X-ELS-APIKey": API_KEY, "Accept": "*/*"})
@@ -692,11 +716,11 @@ def is_data_link_downloadable(link: str, source: str, session: requests.Session)
 
         return False
 
-    # Zenodo
     if source == "zenodo":
         try:
             resp = session.get(link, timeout=20)
-        except Exception:
+        except Exception as e:
+            logger.error("[STEP4] Zenodo GET failed: %s (%s)", link, e, exc_info=True)
             return False
         if resp.status_code != 200:
             return False
@@ -705,15 +729,14 @@ def is_data_link_downloadable(link: str, source: str, session: requests.Session)
             return False
         return bool(resp.content)
 
-    # GitHub
     if source == "github":
         try:
             resp = session.get(link, timeout=20)
-        except Exception:
+        except Exception as e:
+            logger.error("[STEP4] GitHub GET failed: %s (%s)", link, e, exc_info=True)
             return False
         return resp.status_code == 200
 
-    # autres (mendeley, other) : pas testés
     return False
 
 
@@ -732,6 +755,7 @@ def _process_one_link_step4(row, worker_id: int, total: int, counter: dict):
     except Exception as e:
         db.rollback()
         print(f"[STEP4] PID {pid} link {link}: ERROR {e}", file=sys.stderr)
+        logger.error("[STEP4] PID %s link %s: %s", pid, link, e, exc_info=True)
     finally:
         cur.close()
         db.close()
@@ -760,6 +784,7 @@ def step4_check_downloadable():
                 f.result()
             except Exception as e:
                 print(f"[STEP4] worker error: {e}", file=sys.stderr)
+                logger.error("[STEP4] worker error: %s", e, exc_info=True)
 
 
 # ================== Main ==================
@@ -779,11 +804,13 @@ def main():
         print("\nKeyboard interrupt.", file=sys.stderr)
         if CURRENT_PAPER:
             print(f"Last paper: {CURRENT_PAPER}", file=sys.stderr)
+        logger.error("Keyboard interrupt. Last paper: %s", CURRENT_PAPER)
         sys.exit(1)
     except Exception as e:
         print(f"\nFatal error: {e}", file=sys.stderr)
         if CURRENT_PAPER:
             print(f"Last paper: {CURRENT_PAPER}", file=sys.stderr)
+        logger.error("Fatal error: %s. Last paper: %s", e, CURRENT_PAPER, exc_info=True)
         raise
 
 

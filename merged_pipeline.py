@@ -24,27 +24,27 @@ CURRENT_PAPER = None
 GITHUB_API = "https://api.github.com"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # optional
 
-def setup_logging(level=logging.INFO, log_file="pipeline.log", err_file="pipeline.error.log"):
+def setup_error_logging(err_file="pipeline.error.log"):
     root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
+    root.setLevel(logging.ERROR)
     root.handlers.clear()
     root.propagate = False
 
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-
-    h1 = RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
-    h1.setLevel(level)
-    h1.setFormatter(fmt)
-
-    h2 = RotatingFileHandler(err_file, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
-    h2.setLevel(logging.ERROR)
-    h2.setFormatter(fmt)
-
-    root.addHandler(h1)
-    root.addHandler(h2)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
+    h = RotatingFileHandler(err_file, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+    h.setLevel(logging.ERROR)
+    h.setFormatter(fmt)
+    root.addHandler(h)
     return logging.getLogger(__name__)
 
-logger = setup_logging(level=logging.INFO)
+logger = setup_error_logging()
+
+def log_doi_error(doi: str, err: Exception, context: str = ""):
+    doi = doi or "N/A"
+    if context:
+        logger.error("DOI %s: %s: %s", doi, context, err)
+    else:
+        logger.error("DOI %s: Error %s", doi, err)
 
 # ================== Utils ==================
 
@@ -71,7 +71,7 @@ def extract_doi_from_link(doi_link: str) -> str | None:
     return None
 
 
-def http_get_with_retries(session: requests.Session, url: str, headers: dict, max_retries: int = 5) -> requests.Response | None:
+def http_get_with_retries(session: requests.Session, url: str, headers: dict, max_retries: int = 5, doi: str | None = None) -> requests.Response | None:
     last_err = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -87,15 +87,15 @@ def http_get_with_retries(session: requests.Session, url: str, headers: dict, ma
         except requests.HTTPError as e:
             last_err = e
             if not (e.response is not None and 500 <= e.response.status_code < 600):
-                logger.error("HTTP error for %s: %s", url, e, exc_info=True)
+                log_doi_error(doi, e, "HTTP error")
                 return None
         except Exception as e:
             last_err = e
-            logger.error("Request failed for %s: %s", url, e, exc_info=True)
+            log_doi_error(doi, e, "Request failed")
             return None
     msg = f"[HTTP] {url}: giving up after retries ({last_err})"
     print(msg, file=sys.stderr)
-    logger.error(msg)
+    log_doi_error(doi, Exception(msg), "HTTP retries exhausted")
     return None
 
 
@@ -142,13 +142,13 @@ def fetch_elsevier_json(endpoint: str, doi: str, session: requests.Session) -> d
     if not API_KEY or not doi:
         return None
     url = f"https://api.elsevier.com/content/{endpoint}/doi/" + quote(doi)
-    resp = http_get_with_retries(session, url, {"X-ELS-APIKey": API_KEY, "Accept": "application/json"})
+    resp = http_get_with_retries(session, url, {"X-ELS-APIKey": API_KEY, "Accept": "application/json"}, doi=doi)
     if not resp:
         return None
     try:
         return resp.json()
     except Exception as e:
-        logger.error("JSON decode failed for %s DOI %s: %s", endpoint, doi, e, exc_info=True)
+        log_doi_error(doi, e, f"JSON decode failed ({endpoint})")
         return None
 
 
@@ -191,7 +191,7 @@ def step1_load_classification():
             links = json.load(f)
     except Exception as e:
         print(f"[STEP1] cannot read {JSON_PATH}: {e}", file=sys.stderr)
-        logger.error("[STEP1] cannot read %s: %s", JSON_PATH, e, exc_info=True)
+        logger.error("DOI N/A: STEP1 cannot read %s: %s", JSON_PATH, e)
         return
 
     entries = [e for e in links if e.get("doi_link")]
@@ -223,7 +223,7 @@ def step1_load_classification():
         except Exception as e:
             db.rollback()
             print(f"[STEP1] Error inserting {doi}: {e}", file=sys.stderr)
-            logger.error("[STEP1] Error inserting %s: %s", doi, e, exc_info=True)
+            log_doi_error(doi, e, "STEP1 insert failed")
 
         done += 1
         print_progress("[STEP 1] Processing DOIs", done, total)
@@ -321,7 +321,7 @@ def _process_one_paper_step2(row, worker_id: int, total: int, counter: dict):
     except Exception as e:
         db.rollback()
         print(f"[STEP2] PID {pid} DOI {doi}: ERROR {e}", file=sys.stderr)
-        logger.error("[STEP2] PID %s DOI %s: %s", pid, doi, e, exc_info=True)
+        log_doi_error(doi, e, "STEP2 update failed")
     finally:
         cur.close()
         db.close()
@@ -350,7 +350,7 @@ def step2_enrich_with_abstract():
                 f.result()
             except Exception as e:
                 print(f"[STEP2] worker error: {e}", file=sys.stderr)
-                logger.error("[STEP2] worker error: %s", e, exc_info=True)
+                logger.error("DOI N/A: STEP2 worker error: %s", e)
 
 
 # ================== STEP 3: Article API -> EXTRACTION ==================
@@ -479,7 +479,7 @@ def zenodo_data_files_from_link(link: str):
         r = requests.get(f"https://zenodo.org/api/records/{rec_id}", timeout=20)
         r.raise_for_status()
     except Exception as e:
-        logger.error("Zenodo record fetch failed: %s (%s)", link, e, exc_info=True)
+        logger.error("DOI N/A: Zenodo record fetch error: %s", e)
         return []
 
     exts = (".csv", ".xls", ".xlsx", ".json")
@@ -533,7 +533,7 @@ def github_data_files_from_link(link: str):
         ref = repo_info.get("default_branch", "main")
         tree = gh_get(f"/repos/{owner}/{repo}/git/trees/{ref}", params={"recursive": "1"})
     except Exception as e:
-        logger.error("GitHub listing failed: %s (%s)", link, e, exc_info=True)
+        logger.error("DOI N/A: GitHub listing error: %s", e)
         return []
 
     exts = (".csv", ".xls", ".xlsx", ".json")
@@ -579,6 +579,7 @@ def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict):
             session,
             f"https://api.elsevier.com/content/article/doi/{quote(doi)}",
             {"X-ELS-APIKey": API_KEY, "Accept": "application/json"},
+            doi=doi,
         )
         if not article_resp:
             links = []
@@ -641,7 +642,7 @@ def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict):
     except Exception as e:
         db.rollback()
         print(f"[STEP3] PID {pid} DOI {doi}: ERROR {e}", file=sys.stderr)
-        logger.error("[STEP3] PID %s DOI %s: %s", pid, doi, e, exc_info=True)
+        log_doi_error(doi, e, "STEP3 failed")
     finally:
         cur.close()
         db.close()
@@ -670,7 +671,7 @@ def step3_extract_data_links():
                 f.result()
             except Exception as e:
                 print(f"[STEP3] worker error: {e}", file=sys.stderr)
-                logger.error("[STEP3] worker error: %s", e, exc_info=True)
+                logger.error("DOI N/A: STEP3 worker error: %s", e)
 
 
 # ================== STEP 4: verify data_link ==================
@@ -719,8 +720,7 @@ def is_data_link_downloadable(link: str, source: str, session: requests.Session)
     if source == "zenodo":
         try:
             resp = session.get(link, timeout=20)
-        except Exception as e:
-            logger.error("[STEP4] Zenodo GET failed: %s (%s)", link, e, exc_info=True)
+        except Exception:
             return False
         if resp.status_code != 200:
             return False
@@ -732,8 +732,7 @@ def is_data_link_downloadable(link: str, source: str, session: requests.Session)
     if source == "github":
         try:
             resp = session.get(link, timeout=20)
-        except Exception as e:
-            logger.error("[STEP4] GitHub GET failed: %s (%s)", link, e, exc_info=True)
+        except Exception:
             return False
         return resp.status_code == 200
 
@@ -755,7 +754,7 @@ def _process_one_link_step4(row, worker_id: int, total: int, counter: dict):
     except Exception as e:
         db.rollback()
         print(f"[STEP4] PID {pid} link {link}: ERROR {e}", file=sys.stderr)
-        logger.error("[STEP4] PID %s link %s: %s", pid, link, e, exc_info=True)
+        logger.error("DOI N/A: STEP4 link error: %s", e)
     finally:
         cur.close()
         db.close()
@@ -784,7 +783,7 @@ def step4_check_downloadable():
                 f.result()
             except Exception as e:
                 print(f"[STEP4] worker error: {e}", file=sys.stderr)
-                logger.error("[STEP4] worker error: %s", e, exc_info=True)
+                logger.error("DOI N/A: STEP4 worker error: %s", e)
 
 
 # ================== Main ==================
@@ -804,13 +803,15 @@ def main():
         print("\nKeyboard interrupt.", file=sys.stderr)
         if CURRENT_PAPER:
             print(f"Last paper: {CURRENT_PAPER}", file=sys.stderr)
-        logger.error("Keyboard interrupt. Last paper: %s", CURRENT_PAPER)
+        doi = (CURRENT_PAPER or {}).get("doi")
+        logger.error("DOI %s: Keyboard interrupt", doi or "N/A")
         sys.exit(1)
     except Exception as e:
         print(f"\nFatal error: {e}", file=sys.stderr)
         if CURRENT_PAPER:
             print(f"Last paper: {CURRENT_PAPER}", file=sys.stderr)
-        logger.error("Fatal error: %s. Last paper: %s", e, CURRENT_PAPER, exc_info=True)
+        doi = (CURRENT_PAPER or {}).get("doi")
+        log_doi_error(doi, e, "Fatal error")
         raise
 
 

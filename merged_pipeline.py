@@ -5,6 +5,7 @@ import re
 import sys
 import time
 import logging
+import threading
 from logging.handlers import RotatingFileHandler
 from urllib.parse import urlparse, urlencode, urlunparse, parse_qsl, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,9 +21,11 @@ JSON_PATH = "ResearchTestLinks.json"
 NUM_WORKERS = 4
 
 CURRENT_PAPER = None
+CURRENT_DOI = None
 
 GITHUB_API = "https://api.github.com"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # optional
+
 
 def setup_error_logging(err_file: str | None = None):
     if err_file is None:
@@ -39,9 +42,11 @@ def setup_error_logging(err_file: str | None = None):
     h.setLevel(logging.ERROR)
     h.setFormatter(fmt)
     root.addHandler(h)
-    return logging.getLogger(__name__)
+    return logging.getLogger(__name__), err_file
 
-logger = setup_error_logging()
+
+logger, ERROR_LOG_FILE = setup_error_logging()
+
 
 def log_doi_error(doi: str | None, err: Exception, context: str = ""):
     doi = doi or "N/A"
@@ -49,6 +54,7 @@ def log_doi_error(doi: str | None, err: Exception, context: str = ""):
         logger.error("DOI %s: %s: %s", doi, context, err)
     else:
         logger.error("DOI %s: Error %s", doi, err)
+
 
 # ================== Utils ==================
 
@@ -120,8 +126,8 @@ def http_get_with_retries(
             log_doi_error(doi, e, "Request failed")
             return None
 
-    msg = f"[HTTP] {url}: giving up after retries ({last_err})"
-    print(msg, file=sys.stderr)
+    msg = f"[HTTP] giving up after retries ({last_err})"
+    print(f"[HTTP] {url}: {msg}", file=sys.stderr)
     log_doi_error(doi, Exception(msg), "HTTP retries exhausted")
     return None
 
@@ -319,11 +325,15 @@ def extract_publication_year_from_abstract(data: dict) -> int | None:
     return None
 
 
-def _process_one_paper_step2(row, worker_id: int, total: int, counter: dict):
+def _process_one_paper_step2(row, worker_id: int, total: int, counter: dict, lock: threading.Lock):
+    global CURRENT_DOI
     pid, doi = row
+    CURRENT_DOI = doi
+
     if not doi:
-        counter["done"] += 1
-        print_progress("[STEP 2] Enriching abstracts", counter["done"], total)
+        with lock:
+            counter["done"] += 1
+            print_progress("[STEP 2] Enriching abstracts", counter["done"], total)
         return
 
     db = get_db_connection()
@@ -352,8 +362,9 @@ def _process_one_paper_step2(row, worker_id: int, total: int, counter: dict):
     finally:
         cur.close()
         db.close()
-        counter["done"] += 1
-        print_progress("[STEP 2] Enriching abstracts", counter["done"], total)
+        with lock:
+            counter["done"] += 1
+            print_progress("[STEP 2] Enriching abstracts", counter["done"], total)
 
 
 def step2_enrich_with_abstract():
@@ -366,18 +377,28 @@ def step2_enrich_with_abstract():
 
     total = len(rows)
     counter = {"done": 0}
+    lock = threading.Lock()
 
-    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as ex:
-        futures = [
-            ex.submit(_process_one_paper_step2, row, idx % NUM_WORKERS, total, counter)
-            for idx, row in enumerate(rows)
-        ]
+    ex = ThreadPoolExecutor(max_workers=NUM_WORKERS)
+    futures = []
+    try:
+        for idx, row in enumerate(rows):
+            futures.append(ex.submit(_process_one_paper_step2, row, idx % NUM_WORKERS, total, counter, lock))
+
         for f in as_completed(futures):
-            try:
-                f.result()
-            except Exception as e:
-                print(f"[STEP2] worker error: {e}", file=sys.stderr)
-                logger.error("DOI N/A: STEP2 worker error: %s", e)
+            f.result()
+    except KeyboardInterrupt:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        msg = f"KeyboardInterrupt. Last DOI: {CURRENT_DOI or 'N/A'} (error log: {ERROR_LOG_FILE})"
+        print(msg, file=sys.stderr)
+        logger.error("DOI %s: KeyboardInterrupt", CURRENT_DOI or "N/A")
+        for f in futures:
+            f.cancel()
+        ex.shutdown(wait=False, cancel_futures=True)
+        raise
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
 
 
 # ================== STEP 3: Article API -> EXTRACTION ==================
@@ -474,8 +495,6 @@ def make_elsevier_object_download_url(api_url: str) -> str:
     return urlunparse(parsed._replace(query=urlencode(query)))
 
 
-# ------- Zenodo helpers -------
-
 def zenodo_record_id(s: str) -> str | None:
     s = s.strip()
     m = re.search(r"zenodo\.(\d+)", s, re.IGNORECASE)
@@ -524,8 +543,6 @@ def zenodo_data_files_from_link(link: str):
     return out
 
 
-# ------- GitHub helpers -------
-
 def parse_github_repo(arg: str):
     if arg.startswith("http"):
         p = urlparse(arg)
@@ -572,9 +589,10 @@ def github_data_files_from_link(link: str):
     return [f"https://github.com/{owner}/{repo}/blob/{ref}/{p}" for p in data_paths]
 
 
-def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict):
-    global CURRENT_PAPER
+def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict, lock: threading.Lock):
+    global CURRENT_PAPER, CURRENT_DOI
     pid, title, doi, done_flag = row
+    CURRENT_DOI = doi
     CURRENT_PAPER = {"pid": pid, "doi": doi, "title": title, "worker": worker_id}
 
     db = get_db_connection()
@@ -584,6 +602,7 @@ def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict):
     try:
         if done_flag:
             return
+
         data = fetch_elsevier_json("article", doi, session)
         if not data:
             return
@@ -608,10 +627,7 @@ def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict):
             {"X-ELS-APIKey": API_KEY, "Accept": "application/json"},
             doi=doi,
         )
-        if not article_resp:
-            links = []
-        else:
-            links = extract_data_files(article_resp.text)
+        links = extract_data_files(article_resp.text) if article_resp else []
 
         objects_section = ftr.get("objects", {}).get("object")
         if objects_section:
@@ -673,8 +689,9 @@ def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict):
     finally:
         cur.close()
         db.close()
-        counter["done"] += 1
-        print_progress("[STEP 3] Extracting data links", counter["done"], total)
+        with lock:
+            counter["done"] += 1
+            print_progress("[STEP 3] Extracting data links", counter["done"], total)
 
 
 def step3_extract_data_links():
@@ -687,18 +704,28 @@ def step3_extract_data_links():
 
     total = len(rows)
     counter = {"done": 0}
+    lock = threading.Lock()
 
-    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as ex:
-        futures = [
-            ex.submit(_process_one_paper_step3, row, idx % NUM_WORKERS, total, counter)
-            for idx, row in enumerate(rows)
-        ]
+    ex = ThreadPoolExecutor(max_workers=NUM_WORKERS)
+    futures = []
+    try:
+        for idx, row in enumerate(rows):
+            futures.append(ex.submit(_process_one_paper_step3, row, idx % NUM_WORKERS, total, counter, lock))
+
         for f in as_completed(futures):
-            try:
-                f.result()
-            except Exception as e:
-                print(f"[STEP3] worker error: {e}", file=sys.stderr)
-                logger.error("DOI N/A: STEP3 worker error: %s", e)
+            f.result()
+    except KeyboardInterrupt:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        msg = f"KeyboardInterrupt. Last DOI: {CURRENT_DOI or 'N/A'} (error log: {ERROR_LOG_FILE})"
+        print(msg, file=sys.stderr)
+        logger.error("DOI %s: KeyboardInterrupt", CURRENT_DOI or "N/A")
+        for f in futures:
+            f.cancel()
+        ex.shutdown(wait=False, cancel_futures=True)
+        raise
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
 
 
 # ================== STEP 4: verify data_link ==================
@@ -766,7 +793,7 @@ def is_data_link_downloadable(link: str, source: str, session: requests.Session)
     return False
 
 
-def _process_one_link_step4(row, worker_id: int, total: int, counter: dict):
+def _process_one_link_step4(row, worker_id: int, total: int, counter: dict, lock: threading.Lock):
     pid, link, source = row
     db = get_db_connection()
     cur = db.cursor()
@@ -785,8 +812,9 @@ def _process_one_link_step4(row, worker_id: int, total: int, counter: dict):
     finally:
         cur.close()
         db.close()
-        counter["done"] += 1
-        print_progress("[STEP 4] Checking downloads", counter["done"], total)
+        with lock:
+            counter["done"] += 1
+            print_progress("[STEP 4] Checking downloads", counter["done"], total)
 
 
 def step4_check_downloadable():
@@ -799,10 +827,11 @@ def step4_check_downloadable():
 
     total = len(rows)
     counter = {"done": 0}
+    lock = threading.Lock()
 
     with ThreadPoolExecutor(max_workers=NUM_WORKERS) as ex:
         futures = [
-            ex.submit(_process_one_link_step4, row, idx % NUM_WORKERS, total, counter)
+            ex.submit(_process_one_link_step4, row, idx % NUM_WORKERS, total, counter, lock)
             for idx, row in enumerate(rows)
         ]
         for f in as_completed(futures):
@@ -827,18 +856,17 @@ def main():
         step4_check_downloadable()
         print("=== ALL STEPS DONE ===")
     except KeyboardInterrupt:
-        print("\nKeyboard interrupt.", file=sys.stderr)
-        if CURRENT_PAPER:
-            print(f"Last paper: {CURRENT_PAPER}", file=sys.stderr)
-        doi = (CURRENT_PAPER or {}).get("doi")
-        logger.error("DOI %s: Keyboard interrupt", doi or "N/A")
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        msg = f"Keyboard interrupt. Last DOI: {CURRENT_DOI or 'N/A'} (error log: {ERROR_LOG_FILE})"
+        print(msg, file=sys.stderr)
+        logger.error("DOI %s: KeyboardInterrupt", CURRENT_DOI or "N/A")
         sys.exit(1)
     except Exception as e:
-        print(f"\nFatal error: {e}", file=sys.stderr)
-        if CURRENT_PAPER:
-            print(f"Last paper: {CURRENT_PAPER}", file=sys.stderr)
-        doi = (CURRENT_PAPER or {}).get("doi")
-        log_doi_error(doi, e, "Fatal error")
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        print(f"Fatal error: {e}", file=sys.stderr)
+        log_doi_error(CURRENT_DOI, e, "Fatal error")
         raise
 
 

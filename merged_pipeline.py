@@ -24,7 +24,11 @@ CURRENT_PAPER = None
 GITHUB_API = "https://api.github.com"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # optional
 
-def setup_error_logging(err_file="pipeline.error.log"):
+def setup_error_logging(err_file: str | None = None):
+    if err_file is None:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        err_file = f"error_log_{ts}.log"
+
     root = logging.getLogger()
     root.setLevel(logging.ERROR)
     root.handlers.clear()
@@ -39,7 +43,7 @@ def setup_error_logging(err_file="pipeline.error.log"):
 
 logger = setup_error_logging()
 
-def log_doi_error(doi: str, err: Exception, context: str = ""):
+def log_doi_error(doi: str | None, err: Exception, context: str = ""):
     doi = doi or "N/A"
     if context:
         logger.error("DOI %s: %s: %s", doi, context, err)
@@ -71,28 +75,51 @@ def extract_doi_from_link(doi_link: str) -> str | None:
     return None
 
 
-def http_get_with_retries(session: requests.Session, url: str, headers: dict, max_retries: int = 5, doi: str | None = None) -> requests.Response | None:
+def http_get_with_retries(
+    session: requests.Session,
+    url: str,
+    headers: dict,
+    max_retries: int = 5,
+    doi: str | None = None,
+) -> requests.Response | None:
     last_err = None
     for attempt in range(1, max_retries + 1):
         try:
             r = session.get(url, headers=headers, timeout=30)
+
+            if r.status_code == 429:
+                retry_after = r.headers.get("Retry-After")
+                try:
+                    delay = float(retry_after)
+                except (TypeError, ValueError):
+                    delay = min(60.0, 2.0 * attempt)
+
+                if attempt < max_retries:
+                    time.sleep(delay)
+                    continue
+
+                log_doi_error(doi, requests.HTTPError(f"HTTP 429 Too Many Requests (gave up after {attempt} tries)"), "HTTP error")
+                return None
+
             if 500 <= r.status_code < 600:
                 last_err = requests.HTTPError(f"HTTP {r.status_code}")
                 if attempt < max_retries:
-                    time.sleep(3 * attempt)
+                    time.sleep(min(30.0, 2.0 * attempt))
                     continue
                 break
+
             r.raise_for_status()
             return r
+
         except requests.HTTPError as e:
             last_err = e
-            if not (e.response is not None and 500 <= e.response.status_code < 600):
-                log_doi_error(doi, e, "HTTP error")
-                return None
+            log_doi_error(doi, e, "HTTP error")
+            return None
         except Exception as e:
             last_err = e
             log_doi_error(doi, e, "Request failed")
             return None
+
     msg = f"[HTTP] {url}: giving up after retries ({last_err})"
     print(msg, file=sys.stderr)
     log_doi_error(doi, Exception(msg), "HTTP retries exhausted")

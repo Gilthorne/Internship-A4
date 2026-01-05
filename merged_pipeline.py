@@ -98,7 +98,7 @@ def http_get_with_retries(
                 try:
                     delay = float(retry_after)
                 except (TypeError, ValueError):
-                    delay = min(120. 0, 5. 0 * (2 ** (attempt - 1)))
+                    delay = min(120.0, 5.0 * (2 ** (attempt - 1)))
 
                 if attempt < max_retries:
                     time.sleep(delay)

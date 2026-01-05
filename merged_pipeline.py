@@ -18,7 +18,7 @@ load_dotenv()
 
 API_KEY = os.getenv("ELSEVIER_API_KEY")
 JSON_PATH = "ResearchTestLinks.json"
-NUM_WORKERS = 1
+NUM_WORKERS = 4
 
 CURRENT_PAPER = None
 CURRENT_DOI = None
@@ -849,7 +849,8 @@ def main():
         print("=== STEP 1 ===")
         step1_load_classification()
         print("=== STEP 2 ===")
-        step2_enrich_with_abstract()
+        print("Commented because of rate limiting")
+        #step2_enrich_with_abstract()
         print("=== STEP 3 ===")
         step3_extract_data_links()
         print("=== STEP 4 ===")

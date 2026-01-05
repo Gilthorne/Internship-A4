@@ -110,7 +110,7 @@ def http_get_with_retries(
             if 500 <= r.status_code < 600:
                 last_err = requests.HTTPError(f"HTTP {r.status_code}")
                 if attempt < max_retries: 
-                    time.sleep(min(30. 0, 2.0 * attempt))
+                    time.sleep(min(30.0, 2.0 * attempt))
                     continue
                 break
 
@@ -154,7 +154,7 @@ def detect_source_website(link: str) -> str:
 def print_progress(prefix: str, current: int, total: int, bar_width: int = 50):
     if total <= 0:
         bar = "-" * bar_width
-        msg = f"{prefix} [{bar}] {current}/? (0. 0%)"
+        msg = f"{prefix} [{bar}] {current}/? (0.0%)"
     else:
         ratio = max(0.0, min(1.0, current / total))
         filled = int(bar_width * ratio)

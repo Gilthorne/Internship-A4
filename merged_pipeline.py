@@ -18,7 +18,7 @@ load_dotenv()
 
 API_KEY = os.getenv("ELSEVIER_API_KEY")
 JSON_PATH = "ResearchTestLinks.json"
-NUM_WORKERS = 4
+NUM_WORKERS = 1
 
 CURRENT_PAPER = None
 CURRENT_DOI = None
@@ -27,7 +27,7 @@ GITHUB_API = "https://api.github.com"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # optional
 
 
-def setup_error_logging(err_file: str | None = None):
+def setup_error_logging(err_file:  str | None = None):
     if err_file is None:
         ts = time.strftime("%Y%m%d_%H%M%S")
         err_file = f"error_log_{ts}.log"
@@ -51,7 +51,7 @@ logger, ERROR_LOG_FILE = setup_error_logging()
 def log_doi_error(doi: str | None, err: Exception, context: str = ""):
     doi = doi or "N/A"
     if context:
-        logger.error("DOI %s: %s: %s", doi, context, err)
+        logger.error("DOI %s: %s:  %s", doi, context, err)
     else:
         logger.error("DOI %s: Error %s", doi, err)
 
@@ -61,7 +61,7 @@ def log_doi_error(doi: str | None, err: Exception, context: str = ""):
 def get_db_connection():
     return sql.connect(
         user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
+        password=os. getenv("DB_PASSWORD"),
         host=os.getenv("DB_HOST"),
         database=os.getenv("DB_NAME"),
         autocommit=False,
@@ -69,15 +69,15 @@ def get_db_connection():
 
 
 def extract_doi_from_link(doi_link: str) -> str | None:
-    if not doi_link:
+    if not doi_link: 
         return None
     parsed = urlparse(doi_link)
-    path = parsed.path.lstrip("/")
-    if path:
+    path = parsed.path. lstrip("/")
+    if path: 
         return path
-    parts = doi_link.split("doi.org/", 1)
+    parts = doi_link.split("doi. org/", 1)
     if len(parts) == 2 and parts[1]:
-        return parts[1].lstrip("/")
+        return parts[1]. lstrip("/")
     return None
 
 
@@ -98,7 +98,7 @@ def http_get_with_retries(
                 try:
                     delay = float(retry_after)
                 except (TypeError, ValueError):
-                    delay = min(60.0, 2.0 * attempt)
+                    delay = min(120. 0, 5. 0 * (2 ** (attempt - 1)))
 
                 if attempt < max_retries:
                     time.sleep(delay)
@@ -109,15 +109,15 @@ def http_get_with_retries(
 
             if 500 <= r.status_code < 600:
                 last_err = requests.HTTPError(f"HTTP {r.status_code}")
-                if attempt < max_retries:
-                    time.sleep(min(30.0, 2.0 * attempt))
+                if attempt < max_retries: 
+                    time.sleep(min(30. 0, 2.0 * attempt))
                     continue
                 break
 
             r.raise_for_status()
             return r
 
-        except requests.HTTPError as e:
+        except requests. HTTPError as e:
             last_err = e
             log_doi_error(doi, e, "HTTP error")
             return None
@@ -154,7 +154,7 @@ def detect_source_website(link: str) -> str:
 def print_progress(prefix: str, current: int, total: int, bar_width: int = 50):
     if total <= 0:
         bar = "-" * bar_width
-        msg = f"{prefix} [{bar}] {current}/? (0.0%)"
+        msg = f"{prefix} [{bar}] {current}/? (0. 0%)"
     else:
         ratio = max(0.0, min(1.0, current / total))
         filled = int(bar_width * ratio)
@@ -180,14 +180,14 @@ def fetch_elsevier_json(endpoint: str, doi: str, session: requests.Session) -> d
         return None
     try:
         return resp.json()
-    except Exception as e:
+    except Exception as e: 
         log_doi_error(doi, e, f"JSON decode failed ({endpoint})")
         return None
 
 
-def parse_authors_from_coredata(core: dict) -> str:
+def parse_authors_from_coredata(core:  dict) -> str:
     authors = []
-    dc_creator = core.get("dc:creator")
+    dc_creator = core.get("dc: creator")
     if isinstance(dc_creator, list):
         for item in dc_creator:
             if isinstance(item, dict):
@@ -224,7 +224,7 @@ def step1_load_classification():
             links = json.load(f)
     except Exception as e:
         print(f"[STEP1] cannot read {JSON_PATH}: {e}", file=sys.stderr)
-        logger.error("DOI N/A: STEP1 cannot read %s: %s", JSON_PATH, e)
+        logger.error("DOI N/A:  STEP1 cannot read %s:  %s", JSON_PATH, e)
         return
 
     entries = [e for e in links if e.get("doi_link")]
@@ -241,14 +241,14 @@ def step1_load_classification():
     )
 
     for entry in entries:
-        doi = extract_doi_from_link(entry.get("doi_link"))
+        doi = extract_doi_from_link(entry. get("doi_link"))
         title = entry.get("title") or "N/A"
         if not doi:
             done += 1
             print_progress("[STEP 1] Processing DOIs", done, total)
             continue
 
-        try:
+        try: 
             cur.execute(select_sql, (doi,))
             if not cur.fetchone():
                 cur.execute(insert_sql, (title, "", doi, False, False, False))
@@ -268,7 +268,7 @@ def step1_load_classification():
 # ================== STEP 2: Abstract API -> enrich CLASSIFICATION ==================
 
 def extract_countries_from_abstract(data: dict) -> list[str]:
-    countries: set[str] = set()
+    countries:  set[str] = set()
     arr = data.get("abstracts-retrieval-response") or {}
     item = arr.get("item") or {}
     bib = item.get("bibrecord") or {}
@@ -288,7 +288,7 @@ def extract_countries_from_abstract(data: dict) -> list[str]:
 
 
 def extract_organizations_from_abstract(data: dict) -> list[str]:
-    orgs: set[str] = set()
+    orgs:  set[str] = set()
     arr = data.get("abstracts-retrieval-response") or {}
     item = arr.get("item") or {}
     bib = item.get("bibrecord") or {}
@@ -342,7 +342,7 @@ def _process_one_paper_step2(row, worker_id: int, total: int, counter: dict, loc
 
     try:
         data = fetch_elsevier_json("abstract", doi, session)
-        if data:
+        if data: 
             year = extract_publication_year_from_abstract(data)
             countries = extract_countries_from_abstract(data)
             orgs = extract_organizations_from_abstract(data)
@@ -370,7 +370,7 @@ def _process_one_paper_step2(row, worker_id: int, total: int, counter: dict, loc
 def step2_enrich_with_abstract():
     db = get_db_connection()
     cur = db.cursor()
-    cur.execute("SELECT id, DOI FROM CLASSIFICATION")
+    cur.execute("SELECT id, DOI FROM CLASSIFICATION WHERE Year IS NULL AND Country IS NULL AND Organization IS NULL")
     rows = cur.fetchall()
     cur.close()
     db.close()
@@ -390,11 +390,11 @@ def step2_enrich_with_abstract():
     except KeyboardInterrupt:
         sys.stdout.write("\n")
         sys.stdout.flush()
-        msg = f"KeyboardInterrupt. Last DOI: {CURRENT_DOI or 'N/A'} (error log: {ERROR_LOG_FILE})"
+        msg = f"KeyboardInterrupt. Last DOI:  {CURRENT_DOI or 'N/A'} (error log: {ERROR_LOG_FILE})"
         print(msg, file=sys.stderr)
         logger.error("DOI %s: KeyboardInterrupt", CURRENT_DOI or "N/A")
         for f in futures:
-            f.cancel()
+            f. cancel()
         ex.shutdown(wait=False, cancel_futures=True)
         raise
     finally:
@@ -404,17 +404,17 @@ def step2_enrich_with_abstract():
 # ================== STEP 3: Article API -> EXTRACTION ==================
 
 PATTERNS = [
-    r"\b\w+\.csv\b",
+    r"\b\w+\. csv\b",
     r"\b\w+\.xlsx?\b",
     r"https?://(?:dx\.)?doi\.org/10\.\d{4,9}/zenodo\.\d+\b",
-    r"https?://data.mendeley\.com/datasets/[^\s\"]+",
+    r"https?://data. mendeley\.com/datasets/[^\s\"]+",
     r"https?://github\.com/[^\s\"]+",
     r"https?://zenodo\.org/[^\s\"]+",
     r"https?://(?:www\.)?elsevier\.com/[^\s\"]+",
 ]
 
 IGNORED_LINKS = {
-    "http://www.elsevier.com/open-access/userlicense/1.0/",
+    "http://www.elsevier.com/open-access/userlicense/1. 0/",
     "https://www.elsevier.com/locate/withdrawalpolicy",
     "https://www.elsevier.com/about/policies/article-withdrawal",
 }
@@ -427,7 +427,7 @@ def extract_data_files(text: str):
     normalized = [x.rstrip(".,);]") for x in found]
     seen, out = set(), []
     for x in normalized:
-        if x.lower() in IGNORED_LINKS:
+        if x. lower() in IGNORED_LINKS:
             continue
         if x not in seen:
             seen.add(x)
@@ -439,7 +439,7 @@ def split_data_vs_other_links(links):
     exts = (".csv", ".xls", ".xlsx", ".json")
     data_files = []
     other_links = []
-    for link in links:
+    for link in links: 
         if not isinstance(link, str):
             other_links.append(link)
             continue
@@ -457,7 +457,7 @@ def map_files_to_elsevier_objects(files, objects_section):
         return files
     if isinstance(objects_section, dict):
         multimedia_objects = [objects_section]
-    else:
+    else: 
         multimedia_objects = list(objects_section)
 
     ref_to_url = {}
@@ -476,7 +476,7 @@ def map_files_to_elsevier_objects(files, objects_section):
     return out
 
 
-def make_elsevier_object_download_url(api_url: str) -> str:
+def make_elsevier_object_download_url(api_url:  str) -> str:
     import os
     try:
         parsed = urlparse(api_url)
@@ -489,7 +489,7 @@ def make_elsevier_object_download_url(api_url: str) -> str:
         mime = "text/csv"
     else:
         return api_url
-    query = dict(parse_qsl(parsed.query))
+    query = dict(parse_qsl(parsed. query))
     query["view"] = "STANDARD"
     query["httpAccept"] = mime
     return urlunparse(parsed._replace(query=urlencode(query)))
@@ -513,7 +513,7 @@ def api_link_to_front_download(url: str) -> str:
         return url
     base = url.replace("/api/records/", "/records/")
     if base.endswith("/content"):
-        base = base[: -len("/content")]
+        base = base[:  -len("/content")]
     return base + "?download=1"
 
 
@@ -525,13 +525,13 @@ def zenodo_data_files_from_link(link: str):
         r = requests.get(f"https://zenodo.org/api/records/{rec_id}", timeout=20)
         r.raise_for_status()
     except Exception as e:
-        logger.error("DOI N/A: Zenodo record fetch error: %s", e)
+        logger.error("DOI N/A:  Zenodo record fetch error:  %s", e)
         return []
 
     exts = (".csv", ".xls", ".xlsx", ".json")
     out = []
     for f in r.json().get("files", []):
-        name = f.get("key") or f.get("filename") or ""
+        name = f. get("key") or f.get("filename") or ""
         if not any(name.lower().endswith(ext) for ext in exts):
             continue
         links = f.get("links") or {}
@@ -583,7 +583,7 @@ def github_data_files_from_link(link: str):
     exts = (".csv", ".xls", ".xlsx", ".json")
     data_paths = [
         e["path"] for e in tree.get("tree", [])
-        if e.get("type") == "blob" and e.get("path", "").lower().endswith(exts)
+        if e. get("type") == "blob" and e.get("path", "").lower().endswith(exts)
     ]
 
     return [f"https://github.com/{owner}/{repo}/blob/{ref}/{p}" for p in data_paths]
@@ -593,7 +593,7 @@ def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict, loc
     global CURRENT_PAPER, CURRENT_DOI
     pid, title, doi, done_flag = row
     CURRENT_DOI = doi
-    CURRENT_PAPER = {"pid": pid, "doi": doi, "title": title, "worker": worker_id}
+    CURRENT_PAPER = {"pid": pid, "doi": doi, "title": title, "worker":  worker_id}
 
     db = get_db_connection()
     cur = db.cursor()
@@ -627,7 +627,7 @@ def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict, loc
             {"X-ELS-APIKey": API_KEY, "Accept": "application/json"},
             doi=doi,
         )
-        links = extract_data_files(article_resp.text) if article_resp else []
+        links = extract_data_files(article_resp. text) if article_resp else []
 
         objects_section = ftr.get("objects", {}).get("object")
         if objects_section:
@@ -635,7 +635,7 @@ def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict, loc
 
         links = [
             make_elsevier_object_download_url(l)
-            if isinstance(l, str) and "api.elsevier.com/content/object/eid/" in l
+            if isinstance(l, str) and "api. elsevier.com/content/object/eid/" in l
             else l
             for l in links
         ]
@@ -657,9 +657,9 @@ def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict, loc
                 else:
                     rows_to_insert.append((pid, base_url, src, l, False))
 
-            elif src == "zenodo":
+            elif src == "zenodo": 
                 zen_files = zenodo_data_files_from_link(l)
-                if zen_files:
+                if zen_files: 
                     for zf in zen_files:
                         rows_to_insert.append((pid, base_url, src, zf, False))
                 else:
@@ -682,7 +682,7 @@ def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict, loc
             )
             db.commit()
 
-    except Exception as e:
+    except Exception as e: 
         db.rollback()
         print(f"[STEP3] PID {pid} DOI {doi}: ERROR {e}", file=sys.stderr)
         log_doi_error(doi, e, "STEP3 failed")
@@ -697,7 +697,7 @@ def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict, loc
 def step3_extract_data_links():
     db = get_db_connection()
     cur = db.cursor()
-    cur.execute("SELECT id, title, DOI, DONE FROM CLASSIFICATION")
+    cur.execute("SELECT id, title, DOI, DONE FROM CLASSIFICATION WHERE DONE = 0")
     rows = cur.fetchall()
     cur.close()
     db.close()
@@ -710,18 +710,18 @@ def step3_extract_data_links():
     futures = []
     try:
         for idx, row in enumerate(rows):
-            futures.append(ex.submit(_process_one_paper_step3, row, idx % NUM_WORKERS, total, counter, lock))
+            futures. append(ex.submit(_process_one_paper_step3, row, idx % NUM_WORKERS, total, counter, lock))
 
         for f in as_completed(futures):
             f.result()
-    except KeyboardInterrupt:
+    except KeyboardInterrupt: 
         sys.stdout.write("\n")
         sys.stdout.flush()
-        msg = f"KeyboardInterrupt. Last DOI: {CURRENT_DOI or 'N/A'} (error log: {ERROR_LOG_FILE})"
-        print(msg, file=sys.stderr)
+        msg = f"KeyboardInterrupt.  Last DOI: {CURRENT_DOI or 'N/A'} (error log: {ERROR_LOG_FILE})"
+        print(msg, file=sys. stderr)
         logger.error("DOI %s: KeyboardInterrupt", CURRENT_DOI or "N/A")
         for f in futures:
-            f.cancel()
+            f. cancel()
         ex.shutdown(wait=False, cancel_futures=True)
         raise
     finally:
@@ -730,7 +730,7 @@ def step3_extract_data_links():
 
 # ================== STEP 4: verify data_link ==================
 
-def is_data_link_downloadable(link: str, source: str, session: requests.Session) -> bool:
+def is_data_link_downloadable(link: str, source:  str, session: requests.Session) -> bool:
     if not isinstance(link, str) or not link.strip():
         return False
 
@@ -765,16 +765,16 @@ def is_data_link_downloadable(link: str, source: str, session: requests.Session)
             if not text_sample:
                 return False
             lower = text_sample.lower()
-            if lower.startswith("<html") or lower.startswith("<!doctype html") or lower.startswith("<service-error"):
+            if lower.startswith("<html") or lower.startswith("<! doctype html") or lower.startswith("<service-error"):
                 return False
             return True
 
         return False
 
-    if source == "zenodo":
+    if source == "zenodo": 
         try:
             resp = session.get(link, timeout=20)
-        except Exception:
+        except Exception: 
             return False
         if resp.status_code != 200:
             return False
@@ -808,7 +808,7 @@ def _process_one_link_step4(row, worker_id: int, total: int, counter: dict, lock
     except Exception as e:
         db.rollback()
         print(f"[STEP4] PID {pid} link {link}: ERROR {e}", file=sys.stderr)
-        logger.error("DOI N/A: STEP4 link error: %s", e)
+        logger.error("DOI N/A:  STEP4 link error:  %s", e)
     finally:
         cur.close()
         db.close()
@@ -827,7 +827,7 @@ def step4_check_downloadable():
 
     total = len(rows)
     counter = {"done": 0}
-    lock = threading.Lock()
+    lock = threading. Lock()
 
     with ThreadPoolExecutor(max_workers=NUM_WORKERS) as ex:
         futures = [
@@ -838,7 +838,7 @@ def step4_check_downloadable():
             try:
                 f.result()
             except Exception as e:
-                print(f"[STEP4] worker error: {e}", file=sys.stderr)
+                print(f"[STEP4] worker error: {e}", file=sys. stderr)
                 logger.error("DOI N/A: STEP4 worker error: %s", e)
 
 
@@ -856,9 +856,9 @@ def main():
         step4_check_downloadable()
         print("=== ALL STEPS DONE ===")
     except KeyboardInterrupt:
-        sys.stdout.write("\n")
+        sys. stdout.write("\n")
         sys.stdout.flush()
-        msg = f"Keyboard interrupt. Last DOI: {CURRENT_DOI or 'N/A'} (error log: {ERROR_LOG_FILE})"
+        msg = f"Keyboard interrupt. Last DOI: {CURRENT_DOI or 'N/A'} (error log:  {ERROR_LOG_FILE})"
         print(msg, file=sys.stderr)
         logger.error("DOI %s: KeyboardInterrupt", CURRENT_DOI or "N/A")
         sys.exit(1)

@@ -18,23 +18,27 @@ load_dotenv()
 
 API_KEY = os.getenv("ELSEVIER_API_KEY")
 JSON_PATH = "ResearchTestLinks.json"
-NUM_WORKERS = 4
+NUM_WORKERS = 1
 
 CURRENT_PAPER = None
 CURRENT_DOI = None
 
 GITHUB_API = "https://api.github.com"
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # optional
+GITHUB_TOKEN = os. getenv("GITHUB_TOKEN")  # optional
 
 
 def setup_error_logging(err_file:  str | None = None):
+    # Créer le dossier error_log s'il n'existe pas
+    log_dir = "error_log"
+    os.makedirs(log_dir, exist_ok=True)
+    
     if err_file is None:
         ts = time.strftime("%Y%m%d_%H%M%S")
-        err_file = f"error_log_{ts}.log"
+        err_file = os.path.join(log_dir, f"error_log_{ts}.log")
 
     root = logging.getLogger()
     root.setLevel(logging.ERROR)
-    root.handlers.clear()
+    root.handlers. clear()
     root.propagate = False
 
     fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
@@ -48,7 +52,7 @@ def setup_error_logging(err_file:  str | None = None):
 logger, ERROR_LOG_FILE = setup_error_logging()
 
 
-def log_doi_error(doi: str | None, err: Exception, context: str = ""):
+def log_doi_error(doi: str | None, err:  Exception, context: str = ""):
     doi = doi or "N/A"
     if context:
         logger.error("DOI %s: %s:  %s", doi, context, err)
@@ -154,7 +158,7 @@ def detect_source_website(link: str) -> str:
 def print_progress(prefix: str, current: int, total: int, bar_width: int = 50):
     if total <= 0:
         bar = "-" * bar_width
-        msg = f"{prefix} [{bar}] {current}/? (0.0%)"
+        msg = f"{prefix} [{bar}] {current}/?  (0. 0%)"
     else:
         ratio = max(0.0, min(1.0, current / total))
         filled = int(bar_width * ratio)
@@ -187,7 +191,7 @@ def fetch_elsevier_json(endpoint: str, doi: str, session: requests.Session) -> d
 
 def parse_authors_from_coredata(core:  dict) -> str:
     authors = []
-    dc_creator = core.get("dc: creator")
+    dc_creator = core.get("dc:creator")
     if isinstance(dc_creator, list):
         for item in dc_creator:
             if isinstance(item, dict):
@@ -300,7 +304,7 @@ def extract_organizations_from_abstract(data: dict) -> list[str]:
         aff = g.get("affiliation") or {}
         if isinstance(aff, dict):
             aff = [aff]
-        for a in aff:
+        for a in aff: 
             org_list = a.get("organization") or []
             if isinstance(org_list, dict):
                 org_list = [org_list]
@@ -313,7 +317,7 @@ def extract_organizations_from_abstract(data: dict) -> list[str]:
 
 
 def extract_publication_year_from_abstract(data: dict) -> int | None:
-    arr = data.get("abstracts-retrieval-response") or {}
+    arr = data. get("abstracts-retrieval-response") or {}
     item = arr.get("item") or {}
     bib = item.get("bibrecord") or {}
     head = bib.get("head") or {}
@@ -325,7 +329,7 @@ def extract_publication_year_from_abstract(data: dict) -> int | None:
     return None
 
 
-def _process_one_paper_step2(row, worker_id: int, total: int, counter: dict, lock: threading.Lock):
+def _process_one_paper_step2(row, worker_id: int, total:  int, counter: dict, lock: threading.Lock):
     global CURRENT_DOI
     pid, doi = row
     CURRENT_DOI = doi
@@ -342,7 +346,7 @@ def _process_one_paper_step2(row, worker_id: int, total: int, counter: dict, loc
 
     try:
         data = fetch_elsevier_json("abstract", doi, session)
-        if data: 
+        if data:
             year = extract_publication_year_from_abstract(data)
             countries = extract_countries_from_abstract(data)
             orgs = extract_organizations_from_abstract(data)
@@ -390,7 +394,7 @@ def step2_enrich_with_abstract():
     except KeyboardInterrupt:
         sys.stdout.write("\n")
         sys.stdout.flush()
-        msg = f"KeyboardInterrupt. Last DOI:  {CURRENT_DOI or 'N/A'} (error log: {ERROR_LOG_FILE})"
+        msg = f"KeyboardInterrupt.  Last DOI: {CURRENT_DOI or 'N/A'} (error log: {ERROR_LOG_FILE})"
         print(msg, file=sys.stderr)
         logger.error("DOI %s: KeyboardInterrupt", CURRENT_DOI or "N/A")
         for f in futures:
@@ -414,7 +418,7 @@ PATTERNS = [
 ]
 
 IGNORED_LINKS = {
-    "http://www.elsevier.com/open-access/userlicense/1. 0/",
+    "http://www.elsevier.com/open-access/userlicense/1.0/",
     "https://www.elsevier.com/locate/withdrawalpolicy",
     "https://www.elsevier.com/about/policies/article-withdrawal",
 }
@@ -439,7 +443,7 @@ def split_data_vs_other_links(links):
     exts = (".csv", ".xls", ".xlsx", ".json")
     data_files = []
     other_links = []
-    for link in links: 
+    for link in links:
         if not isinstance(link, str):
             other_links.append(link)
             continue
@@ -513,7 +517,7 @@ def api_link_to_front_download(url: str) -> str:
         return url
     base = url.replace("/api/records/", "/records/")
     if base.endswith("/content"):
-        base = base[:  -len("/content")]
+        base = base[:-len("/content")]
     return base + "?download=1"
 
 
@@ -582,7 +586,7 @@ def github_data_files_from_link(link: str):
 
     exts = (".csv", ".xls", ".xlsx", ".json")
     data_paths = [
-        e["path"] for e in tree.get("tree", [])
+        e["path"] for e in tree. get("tree", [])
         if e. get("type") == "blob" and e.get("path", "").lower().endswith(exts)
     ]
 
@@ -630,7 +634,7 @@ def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict, loc
         links = extract_data_files(article_resp. text) if article_resp else []
 
         objects_section = ftr.get("objects", {}).get("object")
-        if objects_section:
+        if objects_section: 
             links = map_files_to_elsevier_objects(links, objects_section)
 
         links = [
@@ -731,7 +735,7 @@ def step3_extract_data_links():
 # ================== STEP 4: verify data_link ==================
 
 def is_data_link_downloadable(link: str, source:  str, session: requests.Session) -> bool:
-    if not isinstance(link, str) or not link.strip():
+    if not isinstance(link, str) or not link. strip():
         return False
 
     if source == "elsevier" and "api.elsevier.com/content/object/eid/" in link:
@@ -754,7 +758,7 @@ def is_data_link_downloadable(link: str, source:  str, session: requests.Session
         if (
             "application/excel" in ctype
             or "application/vnd.ms-excel" in ctype
-            or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in ctype
+            or "application/vnd.openxmlformats-officedocument. spreadsheetml.sheet" in ctype
         ):
             return bool(sample) and (
                 sample.startswith(b"PK\x03\x04") or sample.startswith(b"\xD0\xCF\x11\xE0")
@@ -774,7 +778,7 @@ def is_data_link_downloadable(link: str, source:  str, session: requests.Session
     if source == "zenodo": 
         try:
             resp = session.get(link, timeout=20)
-        except Exception: 
+        except Exception:
             return False
         if resp.status_code != 200:
             return False
@@ -827,7 +831,7 @@ def step4_check_downloadable():
 
     total = len(rows)
     counter = {"done": 0}
-    lock = threading. Lock()
+    lock = threading.Lock()
 
     with ThreadPoolExecutor(max_workers=NUM_WORKERS) as ex:
         futures = [
@@ -839,7 +843,7 @@ def step4_check_downloadable():
                 f.result()
             except Exception as e:
                 print(f"[STEP4] worker error: {e}", file=sys. stderr)
-                logger.error("DOI N/A: STEP4 worker error: %s", e)
+                logger.error("DOI N/A:  STEP4 worker error: %s", e)
 
 
 # ================== Main ==================
@@ -849,8 +853,7 @@ def main():
         print("=== STEP 1 ===")
         step1_load_classification()
         print("=== STEP 2 ===")
-        print("Commented because of rate limiting")
-        #step2_enrich_with_abstract()
+        step2_enrich_with_abstract()
         print("=== STEP 3 ===")
         step3_extract_data_links()
         print("=== STEP 4 ===")

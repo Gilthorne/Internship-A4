@@ -271,70 +271,85 @@ def step1_load_classification():
 
 # ================== STEP 2: Abstract API -> enrich CLASSIFICATION ==================
 
-def extract_countries_from_abstract(data: dict) -> list[str]:
-    countries: set[str] = set()
+def _normalize_to_list(item):
+    """Convertit un dict en liste contenant ce dict, ou retourne la liste telle quelle."""
+    return [item] if isinstance(item, dict) else (item if isinstance(item, list) else [])
+
+def _get_abstract_metadata(data: dict) -> dict:
+    """Extrait les métadonnées communes de la réponse abstract."""
     arr = data.get("abstracts-retrieval-response") or {}
     item = arr.get("item") or {}
     bib = item.get("bibrecord") or {}
     head = bib.get("head") or {}
-    ag = head.get("author-group") or []
-    if isinstance(ag, dict):
-        ag = [ag]
-    for g in ag:
-        aff = g.get("affiliation") or {}
-        if isinstance(aff, dict):
-            aff = [aff]
-        for a in aff:
-            c = a.get("country")
-            if isinstance(c, str) and c.strip():
-                countries.add(c.strip())
-    return sorted(countries)
+    return {"head": head, "bib": bib}
 
+def extract_countries_from_abstract(data: dict) -> list[str]:
+    countries: set[str] = set()
+    metadata = _get_abstract_metadata(data)
+    author_groups = _normalize_to_list(metadata["head"].get("author-group"))
+    
+    for group in author_groups:
+        affiliations = _normalize_to_list(group.get("affiliation"))
+        for aff in affiliations:
+            country = aff.get("country")
+            if isinstance(country, str) and country.strip():
+                countries.add(country.strip())
+    return sorted(countries)
 
 def extract_organizations_from_abstract(data: dict) -> list[str]:
     orgs: set[str] = set()
-    arr = data.get("abstracts-retrieval-response") or {}
-    item = arr.get("item") or {}
-    bib = item.get("bibrecord") or {}
-    head = bib.get("head") or {}
-    ag = head.get("author-group") or []
-    if isinstance(ag, dict):
-        ag = [ag]
-    for g in ag:
-        aff = g.get("affiliation") or {}
-        if isinstance(aff, dict):
-            aff = [aff]
-        for a in aff:
-            org_list = a.get("organization") or []
-            if isinstance(org_list, dict):
-                org_list = [org_list]
-            for o in org_list:
-                if isinstance(o, dict):
-                    name = o.get("$")
+    metadata = _get_abstract_metadata(data)
+    author_groups = _normalize_to_list(metadata["head"].get("author-group"))
+    
+    for group in author_groups:
+        affiliations = _normalize_to_list(group.get("affiliation"))
+        for aff in affiliations:
+            org_list = _normalize_to_list(aff.get("organization"))
+            for org in org_list:
+                if isinstance(org, dict):
+                    name = org.get("$")
                     if isinstance(name, str) and name.strip():
                         orgs.add(name.strip())
     return sorted(orgs)
 
 
 def extract_publication_year_from_abstract(data: dict) -> int | None:
-    arr = data.get("abstracts-retrieval-response") or {}
-    item = arr.get("item") or {}
-    bib = item.get("bibrecord") or {}
-    head = bib.get("head") or {}
-    source = head.get("source") or {}
+    metadata = _get_abstract_metadata(data)
+    source = metadata["head"].get("source") or {}
     pubdate = source.get("publicationdate") or {}
     year_str = pubdate.get("year")
-    if isinstance(year_str, str) and year_str.isdigit():
-        return int(year_str)
-    return None
+    return int(year_str) if isinstance(year_str, str) and year_str.isdigit() else None
 
+
+def _with_db_and_progress(func):
+    """Décorateur pour gérer la connexion DB, les erreurs et la progression."""
+    def wrapper(row, worker_id: int, total: int, counter: dict, lock: threading.Lock, progress_msg: str):
+        db = get_db_connection()
+        cur = db.cursor()
+        session = make_session()
+        
+        try:
+            func(row, cur, session)
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            doi = getattr(row, '__iter__', None) and len(row) > 1 and row[1] or "N/A"
+            print(f"[{progress_msg}] ERROR: {e}", file=sys.stderr)
+            log_doi_error(doi, e, progress_msg)
+        finally:
+            cur.close()
+            db.close()
+            with lock:
+                counter["done"] += 1
+                print_progress(f"[{progress_msg}]", counter["done"], total)
+    return wrapper
 
 def _process_one_paper_step2(row, worker_id: int, total: int, counter: dict, lock: threading.Lock):
     global CURRENT_DOI
     pid, doi = row
     CURRENT_DOI = doi
 
-    if not doi: 
+    if not doi:
         with lock:
             counter["done"] += 1
             print_progress("[STEP 2] Enriching abstracts", counter["done"], total)
@@ -351,12 +366,10 @@ def _process_one_paper_step2(row, worker_id: int, total: int, counter: dict, loc
             countries = extract_countries_from_abstract(data)
             orgs = extract_organizations_from_abstract(data)
 
-            country_str = "; ".join(countries) if countries else None
-            org_str = "; ".join(orgs) if orgs else None
-
             cur.execute(
                 "UPDATE CLASSIFICATION SET Year=%s, Country=%s, Organization=%s WHERE id=%s",
-                (year, country_str, org_str, pid),
+                (year, "; ".join(countries) if countries else None,
+                 "; ".join(orgs) if orgs else None, pid),
             )
             db.commit()
     except Exception as e:
@@ -407,6 +420,28 @@ def step2_enrich_with_abstract():
 
 # ================== STEP 3: Article API -> EXTRACTION ==================
 
+def _clean_unicode_and_url(text: str) -> str:
+    """Nettoie les caractères Unicode problématiques et les suffixes parasites d'une URL."""
+    if not text:
+        return text
+    
+    # Décoder les caractères URL-encodés
+    text = unquote(text)
+    
+    # Retirer les caractères Unicode problématiques
+    replacements = [
+        ('\\u201c', ''), ('\\u201d', ''), ('\u201c', ''), ('\u201d', ''),
+        ('\\u2019', ''), ('\u2019', ''), ('⟩', ''), ('〉', '')
+    ]
+    for old, new in replacements:
+        text = text.replace(old, new)
+    
+    # Retirer les suffixes parasites
+    text = re.sub(r'\.(http:|https:).*$', '', text)
+    text = re.sub(r'(date|Date|DATE)$', '', text)
+    
+    return text.strip()
+
 PATTERNS = [
     r"\b\w+\. csv\b",
     r"\b\w+\.xlsx?\b",
@@ -430,49 +465,26 @@ def extract_data_files(text: str):
         found.extend(re.findall(p, text, re.IGNORECASE))
     
     # Normaliser et nettoyer les liens
-    normalized = []
-    for x in found:
-        # Retirer la ponctuation finale
-        x = x.rstrip(".,);]\"'")
-        
-        # Décoder les caractères URL-encodés
-        x = unquote(x)
-        
-        # Nettoyer les caractères Unicode mal échappés et autres parasites
-        x = x.replace('\\u201c', '').replace('\\u201d', '').replace('\u201c', '').replace('\u201d', '')
-        x = x.replace('\\u2019', '').replace('\u2019', '')
-        x = x.replace('⟩', '').replace('〉', '')  # Caractères asiatiques
-        
-        # Retirer les suffixes parasites courants
-        x = re.sub(r'\.(http:|https:).*$', '', x)
-        x = re.sub(r'(date|Date|DATE)$', '', x)
-        
-        x = x.strip()
-        normalized.append(x)
+    normalized = [_clean_unicode_and_url(x.rstrip(".,);]\"'")) for x in found]
     
+    # Dédupliquer et filtrer les liens ignorés
     seen, out = set(), []
     for x in normalized:
-        if not x or x.lower() in IGNORED_LINKS:
-            continue
-        if x not in seen:
+        if x and x.lower() not in IGNORED_LINKS and x not in seen:
             seen.add(x)
             out.append(x)
     return out
 
 
+DATA_FILE_EXTENSIONS = (".csv", ".xls", ".xlsx", ".json")
+
+def is_data_file(link: str) -> bool:
+    """Vérifie si un lien pointe vers un fichier de données."""
+    return isinstance(link, str) and any(link.lower().endswith(ext) for ext in DATA_FILE_EXTENSIONS)
+
 def split_data_vs_other_links(links):
-    exts = (".csv", ".xls", ".xlsx", ".json")
-    data_files = []
-    other_links = []
-    for link in links:
-        if not isinstance(link, str):
-            other_links.append(link)
-            continue
-        low = link.lower()
-        if any(low.endswith(ext) for ext in exts):
-            data_files.append(link)
-        else:
-            other_links.append(link)
+    data_files = [link for link in links if is_data_file(link)]
+    other_links = [link for link in links if not is_data_file(link)]
     return data_files, other_links
 
 
@@ -550,21 +562,18 @@ def zenodo_data_files_from_link(link: str):
         r = requests.get(f"https://zenodo.org/api/records/{rec_id}", timeout=20)
         r.raise_for_status()
     except Exception as e:
-        logger.error("DOI N/A:  Zenodo record fetch error:  %s", e)
+        logger.error("DOI N/A: Zenodo record fetch error: %s", e)
         return []
 
-    exts = (".csv", ".xls", ".xlsx", ".json")
     out = []
     for f in r.json().get("files", []):
         name = f.get("key") or f.get("filename") or ""
-        if not any(name.lower().endswith(ext) for ext in exts):
+        if not is_data_file(name):
             continue
         links = f.get("links") or {}
-        api_url = links.get("download") or links.get("self") or ""
-        if not api_url:
-            continue
-        front_url = api_link_to_front_download(api_url)
-        out.append(front_url)
+        api_url = links.get("download") or links.get("self")
+        if api_url:
+            out.append(api_link_to_front_download(api_url))
     return out
 
 
@@ -573,49 +582,29 @@ def parse_github_repo(arg: str):
         return None, None
     
     # Nettoyer l'URL
-    arg = arg.strip()
-    
-    # Décoder les caractères URL-encodés
-    arg = unquote(arg)
-    
-    # Retirer les caractères Unicode problématiques
-    arg = arg.replace('\\u201c', '').replace('\\u201d', '').replace('\u201c', '').replace('\u201d', '')
-    arg = arg.replace('\\u2019', '').replace('\u2019', '')
-    arg = arg.replace('⟩', '').replace('〉', '')  # Caractères asiatiques
-    
-    # Retirer les protocoles/extensions parasites à la fin
-    arg = re.sub(r'\.(http:|https:).*$', '', arg)
-    arg = re.sub(r'(date|Date|DATE)$', '', arg)
-    arg = arg.rstrip('.,;:  /')
+    arg = _clean_unicode_and_url(arg).rstrip('.,;:  /')
     
     if arg.startswith("http"):
         try:
             p = urlparse(arg)
-            # Vérifier que c'est bien github.com
             if 'github.com' not in p.netloc.lower():
                 return None, None
             
             parts = p.path.strip("/").split("/")
             if len(parts) >= 2:
-                owner, repo = parts[0], parts[1]
-                if repo.endswith(".git"):
-                    repo = repo[:-4]
+                owner, repo = parts[0], parts[1].removesuffix(".git")
                 
-                # Validation basique - rejeter si caractères invalides
+                # Validation - rejeter si caractères invalides
                 if owner and repo and not any(c in owner+repo for c in ['<', '>', '"', "'", ' ']):
-                    # Nettoyer encore les suffixes parasites
-                    repo = re.sub(r'(date|Date|DATE)$', '', repo)
                     return owner, repo
         except Exception: 
             return None, None
-    elif "/" in arg and not arg.startswith("http"):
+    elif "/" in arg:
         parts = arg.split("/", 1)
         if len(parts) == 2:
-            owner, repo = parts[0], parts[1]
-            # Nettoyer repo de tout ce qui suit un espace ou caractère bizarre
-            repo = repo.split()[0] if ' ' in repo else repo
-            repo = re.sub(r'(date|Date|DATE)$', '', repo)
-            if owner and repo: 
+            owner = parts[0]
+            repo = parts[1].split()[0] if ' ' in parts[1] else parts[1]
+            if owner and repo:
                 return owner, repo
     
     return None, None
@@ -643,10 +632,9 @@ def github_data_files_from_link(link: str):
         logger.error("DOI N/A: GitHub listing error: %s", e)
         return []
 
-    exts = (".csv", ".xls", ".xlsx", ".json")
     data_paths = [
         e["path"] for e in tree.get("tree", [])
-        if e.get("type") == "blob" and e.get("path", "").lower().endswith(exts)
+        if e.get("type") == "blob" and is_data_file(e.get("path", ""))
     ]
 
     return [f"https://github.com/{owner}/{repo}/blob/{ref}/{p}" for p in data_paths]

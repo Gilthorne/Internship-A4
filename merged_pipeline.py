@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 import os
 import json
 import re
@@ -7,7 +7,7 @@ import time
 import logging
 import threading
 from logging.handlers import RotatingFileHandler
-from urllib.parse import urlparse, urlencode, urlunparse, parse_qsl, quote
+from urllib.parse import urlparse, urlencode, urlunparse, parse_qsl, quote, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import mysql.connector as sql
@@ -24,10 +24,10 @@ CURRENT_PAPER = None
 CURRENT_DOI = None
 
 GITHUB_API = "https://api.github.com"
-GITHUB_TOKEN = os. getenv("GITHUB_TOKEN")  # optional
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # optional
 
 
-def setup_error_logging(err_file:  str | None = None):
+def setup_error_logging(err_file: str | None = None):
     # Créer le dossier error_log s'il n'existe pas
     log_dir = "error_log"
     os.makedirs(log_dir, exist_ok=True)
@@ -38,7 +38,7 @@ def setup_error_logging(err_file:  str | None = None):
 
     root = logging.getLogger()
     root.setLevel(logging.ERROR)
-    root.handlers. clear()
+    root.handlers.clear()
     root.propagate = False
 
     fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
@@ -46,13 +46,13 @@ def setup_error_logging(err_file:  str | None = None):
     h.setLevel(logging.ERROR)
     h.setFormatter(fmt)
     root.addHandler(h)
-    return logging.getLogger(__name__), err_file
+    return logging.getLogger(__name__),err_file
 
 
 logger, ERROR_LOG_FILE = setup_error_logging()
 
 
-def log_doi_error(doi: str | None, err:  Exception, context: str = ""):
+def log_doi_error(doi: str | None, err: Exception, context: str = ""):
     doi = doi or "N/A"
     if context:
         logger.error("DOI %s: %s:  %s", doi, context, err)
@@ -65,7 +65,7 @@ def log_doi_error(doi: str | None, err:  Exception, context: str = ""):
 def get_db_connection():
     return sql.connect(
         user=os.getenv("DB_USER"),
-        password=os. getenv("DB_PASSWORD"),
+        password=os.getenv("DB_PASSWORD"),
         host=os.getenv("DB_HOST"),
         database=os.getenv("DB_NAME"),
         autocommit=False,
@@ -73,15 +73,15 @@ def get_db_connection():
 
 
 def extract_doi_from_link(doi_link: str) -> str | None:
-    if not doi_link: 
+    if not doi_link:
         return None
     parsed = urlparse(doi_link)
-    path = parsed.path. lstrip("/")
+    path = parsed.path.lstrip("/")
     if path: 
         return path
-    parts = doi_link.split("doi. org/", 1)
+    parts = doi_link.split("doi.org/",1)
     if len(parts) == 2 and parts[1]:
-        return parts[1]. lstrip("/")
+        return parts[1].lstrip("/")
     return None
 
 
@@ -121,7 +121,7 @@ def http_get_with_retries(
             r.raise_for_status()
             return r
 
-        except requests. HTTPError as e:
+        except requests.HTTPError as e:
             last_err = e
             log_doi_error(doi, e, "HTTP error")
             return None
@@ -189,7 +189,7 @@ def fetch_elsevier_json(endpoint: str, doi: str, session: requests.Session) -> d
         return None
 
 
-def parse_authors_from_coredata(core:  dict) -> str:
+def parse_authors_from_coredata(core: dict) -> str:
     authors = []
     dc_creator = core.get("dc:creator")
     if isinstance(dc_creator, list):
@@ -245,14 +245,14 @@ def step1_load_classification():
     )
 
     for entry in entries:
-        doi = extract_doi_from_link(entry. get("doi_link"))
+        doi = extract_doi_from_link(entry.get("doi_link"))
         title = entry.get("title") or "N/A"
         if not doi:
             done += 1
             print_progress("[STEP 1] Processing DOIs", done, total)
             continue
 
-        try: 
+        try:
             cur.execute(select_sql, (doi,))
             if not cur.fetchone():
                 cur.execute(insert_sql, (title, "", doi, False, False, False))
@@ -272,7 +272,7 @@ def step1_load_classification():
 # ================== STEP 2: Abstract API -> enrich CLASSIFICATION ==================
 
 def extract_countries_from_abstract(data: dict) -> list[str]:
-    countries:  set[str] = set()
+    countries: set[str] = set()
     arr = data.get("abstracts-retrieval-response") or {}
     item = arr.get("item") or {}
     bib = item.get("bibrecord") or {}
@@ -292,7 +292,7 @@ def extract_countries_from_abstract(data: dict) -> list[str]:
 
 
 def extract_organizations_from_abstract(data: dict) -> list[str]:
-    orgs:  set[str] = set()
+    orgs: set[str] = set()
     arr = data.get("abstracts-retrieval-response") or {}
     item = arr.get("item") or {}
     bib = item.get("bibrecord") or {}
@@ -304,7 +304,7 @@ def extract_organizations_from_abstract(data: dict) -> list[str]:
         aff = g.get("affiliation") or {}
         if isinstance(aff, dict):
             aff = [aff]
-        for a in aff: 
+        for a in aff:
             org_list = a.get("organization") or []
             if isinstance(org_list, dict):
                 org_list = [org_list]
@@ -317,7 +317,7 @@ def extract_organizations_from_abstract(data: dict) -> list[str]:
 
 
 def extract_publication_year_from_abstract(data: dict) -> int | None:
-    arr = data. get("abstracts-retrieval-response") or {}
+    arr = data.get("abstracts-retrieval-response") or {}
     item = arr.get("item") or {}
     bib = item.get("bibrecord") or {}
     head = bib.get("head") or {}
@@ -329,12 +329,12 @@ def extract_publication_year_from_abstract(data: dict) -> int | None:
     return None
 
 
-def _process_one_paper_step2(row, worker_id: int, total:  int, counter: dict, lock: threading.Lock):
+def _process_one_paper_step2(row, worker_id: int, total: int, counter: dict, lock: threading.Lock):
     global CURRENT_DOI
     pid, doi = row
     CURRENT_DOI = doi
 
-    if not doi:
+    if not doi: 
         with lock:
             counter["done"] += 1
             print_progress("[STEP 2] Enriching abstracts", counter["done"], total)
@@ -398,7 +398,7 @@ def step2_enrich_with_abstract():
         print(msg, file=sys.stderr)
         logger.error("DOI %s: KeyboardInterrupt", CURRENT_DOI or "N/A")
         for f in futures:
-            f. cancel()
+            f.cancel()
         ex.shutdown(wait=False, cancel_futures=True)
         raise
     finally:
@@ -410,11 +410,11 @@ def step2_enrich_with_abstract():
 PATTERNS = [
     r"\b\w+\. csv\b",
     r"\b\w+\.xlsx?\b",
-    r"https?://(?:dx\.)?doi\.org/10\.\d{4,9}/zenodo\.\d+\b",
-    r"https?://data. mendeley\.com/datasets/[^\s\"]+",
-    r"https?://github\.com/[^\s\"]+",
-    r"https?://zenodo\.org/[^\s\"]+",
-    r"https?://(?:www\.)?elsevier\.com/[^\s\"]+",
+    r"https?://(?:dx\.)?doi\.org/10\.\d{4,9}/zenodo\.\d+",
+    r"https?://data\.mendeley\.com/datasets/[^\s\"'<>]+",
+    r"https?://github\.com/[a-zA-Z0-9_-]+/[a-zA-Z0-9._-]+(?:/[^\s\"'<>]*)?",
+    r"https?://zenodo\.org/[^\s\"'<>]+",
+    r"https?://(?:www\.)?elsevier\.com/[^\s\"'<>]+",
 ]
 
 IGNORED_LINKS = {
@@ -428,10 +428,31 @@ def extract_data_files(text: str):
     found = []
     for p in PATTERNS:
         found.extend(re.findall(p, text, re.IGNORECASE))
-    normalized = [x.rstrip(".,);]") for x in found]
+    
+    # Normaliser et nettoyer les liens
+    normalized = []
+    for x in found:
+        # Retirer la ponctuation finale
+        x = x.rstrip(".,);]\"'")
+        
+        # Décoder les caractères URL-encodés
+        x = unquote(x)
+        
+        # Nettoyer les caractères Unicode mal échappés et autres parasites
+        x = x.replace('\\u201c', '').replace('\\u201d', '').replace('\u201c', '').replace('\u201d', '')
+        x = x.replace('\\u2019', '').replace('\u2019', '')
+        x = x.replace('⟩', '').replace('〉', '')  # Caractères asiatiques
+        
+        # Retirer les suffixes parasites courants
+        x = re.sub(r'\.(http:|https:).*$', '', x)
+        x = re.sub(r'(date|Date|DATE)$', '', x)
+        
+        x = x.strip()
+        normalized.append(x)
+    
     seen, out = set(), []
     for x in normalized:
-        if x. lower() in IGNORED_LINKS:
+        if not x or x.lower() in IGNORED_LINKS:
             continue
         if x not in seen:
             seen.add(x)
@@ -493,7 +514,7 @@ def make_elsevier_object_download_url(api_url:  str) -> str:
         mime = "text/csv"
     else:
         return api_url
-    query = dict(parse_qsl(parsed. query))
+    query = dict(parse_qsl(parsed.query))
     query["view"] = "STANDARD"
     query["httpAccept"] = mime
     return urlunparse(parsed._replace(query=urlencode(query)))
@@ -535,7 +556,7 @@ def zenodo_data_files_from_link(link: str):
     exts = (".csv", ".xls", ".xlsx", ".json")
     out = []
     for f in r.json().get("files", []):
-        name = f. get("key") or f.get("filename") or ""
+        name = f.get("key") or f.get("filename") or ""
         if not any(name.lower().endswith(ext) for ext in exts):
             continue
         links = f.get("links") or {}
@@ -548,17 +569,55 @@ def zenodo_data_files_from_link(link: str):
 
 
 def parse_github_repo(arg: str):
+    if not arg or not isinstance(arg, str):
+        return None, None
+    
+    # Nettoyer l'URL
+    arg = arg.strip()
+    
+    # Décoder les caractères URL-encodés
+    arg = unquote(arg)
+    
+    # Retirer les caractères Unicode problématiques
+    arg = arg.replace('\\u201c', '').replace('\\u201d', '').replace('\u201c', '').replace('\u201d', '')
+    arg = arg.replace('\\u2019', '').replace('\u2019', '')
+    arg = arg.replace('⟩', '').replace('〉', '')  # Caractères asiatiques
+    
+    # Retirer les protocoles/extensions parasites à la fin
+    arg = re.sub(r'\.(http:|https:).*$', '', arg)
+    arg = re.sub(r'(date|Date|DATE)$', '', arg)
+    arg = arg.rstrip('.,;:  /')
+    
     if arg.startswith("http"):
-        p = urlparse(arg)
-        parts = p.path.strip("/").split("/")
-        if len(parts) >= 2:
+        try:
+            p = urlparse(arg)
+            # Vérifier que c'est bien github.com
+            if 'github.com' not in p.netloc.lower():
+                return None, None
+            
+            parts = p.path.strip("/").split("/")
+            if len(parts) >= 2:
+                owner, repo = parts[0], parts[1]
+                if repo.endswith(".git"):
+                    repo = repo[:-4]
+                
+                # Validation basique - rejeter si caractères invalides
+                if owner and repo and not any(c in owner+repo for c in ['<', '>', '"', "'", ' ']):
+                    # Nettoyer encore les suffixes parasites
+                    repo = re.sub(r'(date|Date|DATE)$', '', repo)
+                    return owner, repo
+        except Exception: 
+            return None, None
+    elif "/" in arg and not arg.startswith("http"):
+        parts = arg.split("/", 1)
+        if len(parts) == 2:
             owner, repo = parts[0], parts[1]
-            if repo.endswith(".git"):
-                repo = repo[:-4]
-            return owner, repo
-    if "/" in arg and not arg.startswith("http"):
-        owner, repo = arg.split("/", 1)
-        return owner, repo
+            # Nettoyer repo de tout ce qui suit un espace ou caractère bizarre
+            repo = repo.split()[0] if ' ' in repo else repo
+            repo = re.sub(r'(date|Date|DATE)$', '', repo)
+            if owner and repo: 
+                return owner, repo
+    
     return None, None
 
 
@@ -586,8 +645,8 @@ def github_data_files_from_link(link: str):
 
     exts = (".csv", ".xls", ".xlsx", ".json")
     data_paths = [
-        e["path"] for e in tree. get("tree", [])
-        if e. get("type") == "blob" and e.get("path", "").lower().endswith(exts)
+        e["path"] for e in tree.get("tree", [])
+        if e.get("type") == "blob" and e.get("path", "").lower().endswith(exts)
     ]
 
     return [f"https://github.com/{owner}/{repo}/blob/{ref}/{p}" for p in data_paths]
@@ -597,7 +656,7 @@ def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict, loc
     global CURRENT_PAPER, CURRENT_DOI
     pid, title, doi, done_flag = row
     CURRENT_DOI = doi
-    CURRENT_PAPER = {"pid": pid, "doi": doi, "title": title, "worker":  worker_id}
+    CURRENT_PAPER = {"pid": pid, "doi": doi, "title": title, "worker": worker_id}
 
     db = get_db_connection()
     cur = db.cursor()
@@ -631,7 +690,7 @@ def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict, loc
             {"X-ELS-APIKey": API_KEY, "Accept": "application/json"},
             doi=doi,
         )
-        links = extract_data_files(article_resp. text) if article_resp else []
+        links = extract_data_files(article_resp.text) if article_resp else []
 
         objects_section = ftr.get("objects", {}).get("object")
         if objects_section: 
@@ -639,7 +698,7 @@ def _process_one_paper_step3(row, worker_id: int, total: int, counter: dict, loc
 
         links = [
             make_elsevier_object_download_url(l)
-            if isinstance(l, str) and "api. elsevier.com/content/object/eid/" in l
+            if isinstance(l, str) and "api.elsevier.com/content/object/eid/" in l
             else l
             for l in links
         ]
@@ -714,18 +773,18 @@ def step3_extract_data_links():
     futures = []
     try:
         for idx, row in enumerate(rows):
-            futures. append(ex.submit(_process_one_paper_step3, row, idx % NUM_WORKERS, total, counter, lock))
+            futures.append(ex.submit(_process_one_paper_step3, row, idx % NUM_WORKERS, total, counter, lock))
 
         for f in as_completed(futures):
             f.result()
-    except KeyboardInterrupt: 
+    except KeyboardInterrupt:
         sys.stdout.write("\n")
         sys.stdout.flush()
-        msg = f"KeyboardInterrupt.  Last DOI: {CURRENT_DOI or 'N/A'} (error log: {ERROR_LOG_FILE})"
-        print(msg, file=sys. stderr)
+        msg = f"KeyboardInterrupt. Last DOI: {CURRENT_DOI or 'N/A'} (error log: {ERROR_LOG_FILE})"
+        print(msg, file=sys.stderr)
         logger.error("DOI %s: KeyboardInterrupt", CURRENT_DOI or "N/A")
         for f in futures:
-            f. cancel()
+            f.cancel()
         ex.shutdown(wait=False, cancel_futures=True)
         raise
     finally:
@@ -734,11 +793,11 @@ def step3_extract_data_links():
 
 # ================== STEP 4: verify data_link ==================
 
-def is_data_link_downloadable(link: str, source:  str, session: requests.Session) -> bool:
-    if not isinstance(link, str) or not link. strip():
+def is_data_link_downloadable(link: str, source: str, session: requests.Session) -> bool:
+    if not isinstance(link, str) or not link.strip():
         return False
 
-    if source == "elsevier" and "api.elsevier.com/content/object/eid/" in link:
+    if source == "elsevier" and "api.elsevier.com/content/object/eid/" in link: 
         url = make_elsevier_object_download_url(link)
         resp = http_get_with_retries(session, url, {"X-ELS-APIKey": API_KEY, "Accept": "*/*"})
         if not resp or resp.status_code != 200:
@@ -758,7 +817,7 @@ def is_data_link_downloadable(link: str, source:  str, session: requests.Session
         if (
             "application/excel" in ctype
             or "application/vnd.ms-excel" in ctype
-            or "application/vnd.openxmlformats-officedocument. spreadsheetml.sheet" in ctype
+            or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in ctype
         ):
             return bool(sample) and (
                 sample.startswith(b"PK\x03\x04") or sample.startswith(b"\xD0\xCF\x11\xE0")
@@ -842,8 +901,8 @@ def step4_check_downloadable():
             try:
                 f.result()
             except Exception as e:
-                print(f"[STEP4] worker error: {e}", file=sys. stderr)
-                logger.error("DOI N/A:  STEP4 worker error: %s", e)
+                print(f"[STEP4] worker error: {e}", file=sys.stderr)
+                logger.error("DOI N/A: STEP4 worker error: %s", e)
 
 
 # ================== Main ==================
@@ -860,7 +919,7 @@ def main():
         step4_check_downloadable()
         print("=== ALL STEPS DONE ===")
     except KeyboardInterrupt:
-        sys. stdout.write("\n")
+        sys.stdout.write("\n")
         sys.stdout.flush()
         msg = f"Keyboard interrupt. Last DOI: {CURRENT_DOI or 'N/A'} (error log:  {ERROR_LOG_FILE})"
         print(msg, file=sys.stderr)

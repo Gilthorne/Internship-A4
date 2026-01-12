@@ -21,3 +21,5 @@ test_downloadlink.py
 test_year_affiliation.py
 /test*
 /error_log/*
+/jsons/*
+/old/*

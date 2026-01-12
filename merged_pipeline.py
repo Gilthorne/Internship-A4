@@ -15,6 +15,7 @@ def main():
         print("=== STEP 1 ===")
         run_step1()
         print("=== STEP 2 ===")
+        print("Commented because of rate limit")
         # run_step2()
         print("=== STEP 3 ===")
         run_step3()

@@ -12,53 +12,60 @@ from pipeline_common import (
 )
 
 
-def is_data_link_downloadable(link: str, source: str, session) -> bool:
+def is_data_link_downloadable(link: str, source: str, session: requests.Session) -> bool:
     if not isinstance(link, str) or not link.strip():
         return False
 
     if source == "elsevier" and "api.elsevier.com/content/object/eid/" in link:
-        url = make_elsevier_object_download_url(link)
-        resp = http_get_with_retries(session, url, {"X-ELS-APIKey": API_KEY, "Accept": "*/*"})
+        # Nettoyer l'URL des paramètres httpAccept et view problématiques
+        clean_url = re.sub(r'[?&]httpAccept=[^&]*', '', link)
+        clean_url = re.sub(r'[?&]view=[^&]*', '', clean_url)
+        
+        # Ajouter la clé API dans l'URL si absente
+        separator = '&' if '?' in clean_url else '?'
+        if 'apiKey=' not in clean_url: 
+            clean_url = f"{clean_url}{separator}apiKey={API_KEY}"
+        
+        # Utiliser le header Accept au lieu du paramètre httpAccept
+        headers = {
+            "X-ELS-APIKey": API_KEY,
+            "Accept": "text/csv, application/vnd.ms-excel, application/vnd. openxmlformats-officedocument.spreadsheetml. sheet, application/octet-stream, */*"
+        }
+        
+        resp = http_get_with_retries(session, clean_url, headers)
+        
         if not resp or resp.status_code != 200:
             return False
 
-        ctype = (resp.headers.get("Content-Type") or "").lower()
         clen = resp.headers.get("Content-Length")
         try:
             clen_int = int(clen) if clen is not None else None
         except ValueError:
             clen_int = None
+        
         if clen_int is not None and clen_int <= 0:
             return False
 
-        sample = resp.content[:256]
+        sample = resp.content[: 512]
+        if not sample: 
+            return False
 
-        if (
-            "application/excel" in ctype
-            or "application/vnd.ms-excel" in ctype
-            or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in ctype
-        ):
-            return bool(sample) and (sample.startswith(b"PK\x03\x04") or sample.startswith(b"\xD0\xCF\x11\xE0"))
+        # Vérifier que ce n'est pas du HTML d'erreur
+        text_sample = sample.decode("utf-8", errors="ignore").strip().lower()
+        if text_sample.startswith("<html") or text_sample.startswith("<! doctype") or text_sample.startswith("<service-error"):
+            return False
 
-        if "text/csv" in ctype or "text/plain" in ctype:
-            text_sample = sample.decode("utf-8", errors="ignore").strip()
-            if not text_sample:
-                return False
-            lower = text_sample.lower()
-            if lower.startswith("<html") or lower.startswith("<!doctype html") or lower.startswith("<service-error"):
-                return False
-            return True
+        return True
 
-        return False
-
-    if source == "zenodo":
+    if source == "zenodo": 
         try:
             resp = session.get(link, timeout=30)
         except Exception:
             return False
         if resp.status_code != 200:
             return False
-        if "text/html" in (resp.headers.get("Content-Type") or "").lower():
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if "text/html" in ctype:
             return False
         return bool(resp.content)
 

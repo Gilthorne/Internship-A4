@@ -13,24 +13,24 @@ from pipeline_common import (
 )
 
 
-def is_data_link_downloadable(link: str, source: str, session: requests.Session) -> bool:
+def is_data_link_downloadable(link:  str, source: str, session: requests.Session) -> bool:
     if not isinstance(link, str) or not link.strip():
         return False
 
     if source == "elsevier" and "api.elsevier.com/content/object/eid/" in link:
-        # Nettoyer l'URL des paramètres httpAccept et view problématiques
+        # Clean the URL of problematic httpAccept and view parameters
         clean_url = re.sub(r'[?&]httpAccept=[^&]*', '', link)
         clean_url = re.sub(r'[?&]view=[^&]*', '', clean_url)
         
-        # Ajouter la clé API dans l'URL si absente
+        # Add API key if absent
         separator = '&' if '?' in clean_url else '?'
-        if 'apiKey=' not in clean_url: 
+        if 'apiKey=' not in clean_url:  
             clean_url = f"{clean_url}{separator}apiKey={API_KEY}"
         
-        # Utiliser le header Accept au lieu du paramètre httpAccept
+        # Simplified headers - use generic Accept
         headers = {
             "X-ELS-APIKey": API_KEY,
-            "Accept": "text/csv, application/vnd.ms-excel, application/vnd. openxmlformats-officedocument.spreadsheetml. sheet, application/octet-stream, */*"
+            "Accept": "*/*"  # Simplified - let the server decide based on file extension
         }
         
         resp = http_get_with_retries(session, clean_url, headers)
@@ -47,16 +47,17 @@ def is_data_link_downloadable(link: str, source: str, session: requests.Session)
         if clen_int is not None and clen_int <= 0:
             return False
 
-        sample = resp.content[: 512]
-        if not sample: 
+        sample = resp.content[:512]
+        if not sample:  
             return False
 
-        # Vérifier que ce n'est pas du HTML d'erreur
+        # Check it's not an HTML error
         text_sample = sample.decode("utf-8", errors="ignore").strip().lower()
         if text_sample.startswith("<html") or text_sample.startswith("<! doctype") or text_sample.startswith("<service-error"):
             return False
 
         return True
+
 
     if source == "zenodo": 
         try:

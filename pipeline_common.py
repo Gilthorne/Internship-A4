@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 API_KEY = os.getenv("ELSEVIER_API_KEY")
-JSON_PATH = os.getenv("JSON_PATH", "ResearchLinks2023.json")
+JSON_PATH = os.getenv("JSON_PATH", "ResearchTestLinks.json")
 NUM_WORKERS = int(os.getenv("NUM_WORKERS", "8"))
 
 GITHUB_API = "https://api.github.com"

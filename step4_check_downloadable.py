@@ -1,5 +1,6 @@
 import sys
-
+import re
+import requests
 from pipeline_common import (
     API_KEY,
     get_db_connection,

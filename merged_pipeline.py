@@ -8,19 +8,21 @@ from step1_load_classification import run as run_step1
 from step2_enrich_abstract import run as run_step2
 from step3_extract_data_links import run as run_step3
 from step4_check_downloadable import run as run_step4
-
+from step5_data_request_confidential import run as run_step5
 
 def main():
     try:
         print("=== STEP 1 ===")
-        run_step1()
+        #run_step1()
         print("=== STEP 2 ===")
         print("Commented because of rate limit")
-        # run_step2()
+        #run_step2()
         print("=== STEP 3 ===")
-        run_step3()
+        #run_step3()
         print("=== STEP 4 ===")
-        run_step4()
+        #run_step4()
+        print("=== STEP 5 ===")
+        run_step5()
         print("=== ALL STEPS DONE ===")
     except KeyboardInterrupt:
         sys.stdout.write("\n")

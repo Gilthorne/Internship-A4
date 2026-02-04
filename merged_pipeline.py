@@ -13,16 +13,16 @@ from step5_data_request_confidential import run as run_step5
 def main():
     try:
         print("=== STEP 1 ===")
-        #run_step1()
+        run_step1()
         print("=== STEP 2 ===")
         print("Commented because of rate limit")
         #run_step2()
         print("=== STEP 3 ===")
-        #run_step3()
+        run_step3()
         print("=== STEP 4 ===")
-        #run_step4()
+        run_step4()
         print("=== STEP 5 ===")
-        run_step5()
+        #run_step5()
         print("=== ALL STEPS DONE ===")
     except KeyboardInterrupt:
         sys.stdout.write("\n")

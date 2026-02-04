@@ -437,7 +437,7 @@ def parse_github_repo(arg: str):
         else:
             return None, None
 
-    if arg.startswith("http"):
+    if ag.startswith("http"):
         try:
             p = urlparse(arg)
             if "github.com" not in p.netloc.lower():

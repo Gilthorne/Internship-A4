@@ -279,23 +279,42 @@ def get_metadata(doi: str) -> tuple[dict, str]:
     *metadata_dict* always contains:
         year      (int | None)
         authors   (list[str])
-        countries (list[str])  – empty when Crossref is used (not available)
+        countries (list[str])  – populated from Elsevier when available;
+                                  empty when only Crossref is used (not available)
 
-    *source_label* describes which API produced the result,
+    *source_label* describes which API(s) produced the result,
     or an error message if both APIs failed.
+
+    Strategy:
+        1. Crossref is called first (free, no auth, generous limits).
+           If it returns a year, Elsevier is also called (if key available)
+           to obtain country affiliation data not provided by Crossref.
+        2. If Crossref fails to return a year, Elsevier is used as the
+           primary source for all three fields.
     """
     doi = doi.strip()
 
+    api_key = os.getenv("ELSEVIER_API_KEY")
+
     # 1. Crossref (primary)
     meta = _metadata_from_crossref(doi)
+
     if meta is not None and meta.get("year") is not None:
+        # Crossref never returns countries.  If an Elsevier key is available,
+        # make one extra call to fetch countries (and supplement authors if needed).
+        if api_key:
+            els_meta = _metadata_from_elsevier(doi, api_key)
+            if els_meta is not None:
+                meta["countries"] = els_meta.get("countries") or []
+                if not meta["authors"] and els_meta.get("authors"):
+                    meta["authors"] = els_meta["authors"]
+                return meta, "Crossref (year+authors) + Elsevier (countries)"
         return meta, "Crossref API (free, generous rate limits)"
 
     # Keep Crossref partial results (authors found but no year) as a fallback pool
     crossref_partial = meta  # may be None
 
-    # 2. Elsevier (fallback)
-    api_key = os.getenv("ELSEVIER_API_KEY")
+    # 2. Elsevier (fallback – also used when Crossref found no year)
     if api_key:
         els_meta = _metadata_from_elsevier(doi, api_key)
         if els_meta is not None:

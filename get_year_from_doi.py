@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-get_year_from_doi.py – Extract publication year from a DOI.
+get_year_from_doi.py – Extract publication metadata (year, authors, countries) from a DOI.
 
 Primary  : Crossref API (free, no authentication required)
+           → returns year + authors; country is not available via Crossref.
 Fallback : Elsevier API (requires ELSEVIER_API_KEY; rate-limit respected)
+           → returns year + authors + countries from a single request.
 
 Usage:
     python get_year_from_doi.py 10.1038/nature12373
@@ -74,9 +76,14 @@ def _elsevier_rate_limit() -> None:
 # Crossref helper
 # ---------------------------------------------------------------------------
 
-def _year_from_crossref(doi: str) -> int | None:
+def _metadata_from_crossref(doi: str) -> dict | None:
     """
-    Query the Crossref API and return the publication year, or None on failure.
+    Query the Crossref API and return a metadata dict, or None on failure.
+
+    Returned dict keys:
+        year      (int | None)
+        authors   (list[str])  – "Family Given" formatted names
+        countries (list[str])  – always empty; Crossref does not expose country data
 
     Crossref is free, requires no API key, and has generous rate limits.
     """
@@ -118,7 +125,8 @@ def _year_from_crossref(doi: str) -> int | None:
 
     message = data.get("message") or {}
 
-    # Try published-print → date-parts first, then published-online, then issued
+    # --- Year ---
+    year: int | None = None
     for date_key in ("published-print", "published-online", "issued", "created"):
         date_obj = message.get(date_key)
         if not isinstance(date_obj, dict):
@@ -129,21 +137,42 @@ def _year_from_crossref(doi: str) -> int | None:
         first = parts[0]
         if isinstance(first, list) and first and isinstance(first[0], int):
             year = first[0]
-            _log.info("Crossref: found year %d (field=%s) for DOI %s", year, date_key, doi)
-            return year
+            _log.info("Crossref: year=%d (field=%s) for DOI %s", year, date_key, doi)
+            break
 
-    _log.info("Crossref: no year found in response for DOI %s", doi)
-    return None
+    # --- Authors ---
+    # Each item: {"given": "...", "family": "...", "affiliation": [...]}
+    authors: list[str] = []
+    for author in message.get("author") or []:
+        if not isinstance(author, dict):
+            continue
+        family = (author.get("family") or "").strip()
+        given  = (author.get("given")  or "").strip()
+        if family and given:
+            authors.append(f"{family} {given}")
+        elif family:
+            authors.append(family)
+        elif given:
+            authors.append(given)
+
+    _log.info("Crossref: %d authors found for DOI %s", len(authors), doi)
+    return {"year": year, "authors": authors, "countries": []}
 
 
 # ---------------------------------------------------------------------------
 # Elsevier helper
 # ---------------------------------------------------------------------------
 
-def _year_from_elsevier(doi: str, api_key: str) -> int | None:
+def _metadata_from_elsevier(doi: str, api_key: str) -> dict | None:
     """
-    Query the Elsevier Abstract Retrieval API and return the publication year,
-    or None on failure.  Rate-limits itself to ≤ 1.4 req/s.
+    Query the Elsevier Abstract Retrieval API and return a metadata dict,
+    or None on failure.  Rate-limits itself to ≤ 5 000 req/h.
+
+    Returned dict keys:
+        year      (int | None)
+        authors   (list[str])  – "Family Given" formatted names
+        countries (list[str])  – unique countries from affiliation data
+                                 (available in the same response, no extra call)
     """
     _elsevier_rate_limit()
 
@@ -185,69 +214,135 @@ def _year_from_elsevier(doi: str, api_key: str) -> int | None:
         _log.warning("Elsevier: JSON decode error for DOI %s: %s", doi, exc)
         return None
 
-    # Navigate: abstracts-retrieval-response → coredata → prism:coverDate
-    core = (data.get("abstracts-retrieval-response") or {}).get("coredata") or {}
+    arr = data.get("abstracts-retrieval-response") or {}
 
+    # --- Year (from coredata) ---
+    core = arr.get("coredata") or {}
+    year: int | None = None
     cover_date = core.get("prism:coverDate") or core.get("prism:coverDisplayDate") or ""
     if isinstance(cover_date, str) and len(cover_date) >= 4:
         year_str = cover_date[:4]
         if year_str.isdigit():
             year = int(year_str)
-            _log.info("Elsevier: found year %d (coverDate=%s) for DOI %s", year, cover_date, doi)
-            return year
+            _log.info("Elsevier: year=%d (coverDate=%s) for DOI %s", year, cover_date, doi)
 
-    _log.info("Elsevier: no year found in response for DOI %s", doi)
-    return None
+    # --- Authors ---
+    # Path: abstracts-retrieval-response → authors → author (list or dict)
+    authors: list[str] = []
+    authors_section = arr.get("authors") or {}
+    raw_authors = authors_section.get("author") or []
+    if isinstance(raw_authors, dict):
+        raw_authors = [raw_authors]
+    for author in raw_authors:
+        if not isinstance(author, dict):
+            continue
+        # Prefer preferred-name block; fall back to top-level fields
+        pref = author.get("preferred-name") or author
+        surname   = (pref.get("ce:surname")     or "").strip()
+        given     = (pref.get("ce:given-name")  or
+                     pref.get("ce:initials")    or "").strip()
+        if surname and given:
+            authors.append(f"{surname} {given}")
+        elif surname:
+            authors.append(surname)
+        elif given:
+            authors.append(given)
+    _log.info("Elsevier: %d authors found for DOI %s", len(authors), doi)
+
+    # --- Countries (same response, no extra API call) ---
+    # Path: abstracts-retrieval-response → affiliation (list or dict)
+    countries: list[str] = []
+    raw_affiliations = arr.get("affiliation") or []
+    if isinstance(raw_affiliations, dict):
+        raw_affiliations = [raw_affiliations]
+    seen_countries: set[str] = set()
+    for aff in raw_affiliations:
+        if not isinstance(aff, dict):
+            continue
+        country = (aff.get("affiliation-country") or "").strip()
+        if country and country not in seen_countries:
+            seen_countries.add(country)
+            countries.append(country)
+    _log.info("Elsevier: %d countries found for DOI %s", len(countries), doi)
+
+    return {"year": year, "authors": authors, "countries": countries}
 
 
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def get_year(doi: str) -> tuple[int | None, str]:
+def get_metadata(doi: str) -> tuple[dict, str]:
     """
-    Return ``(year, source_label)`` where *source_label* describes which API
-    produced the result, or ``(None, error_message)`` on complete failure.
+    Return ``(metadata_dict, source_label)``.
+
+    *metadata_dict* always contains:
+        year      (int | None)
+        authors   (list[str])
+        countries (list[str])  – empty when Crossref is used (not available)
+
+    *source_label* describes which API produced the result,
+    or an error message if both APIs failed.
     """
     doi = doi.strip()
 
     # 1. Crossref (primary)
-    year = _year_from_crossref(doi)
-    if year is not None:
-        return year, "Crossref API (free, generous rate limits)"
+    meta = _metadata_from_crossref(doi)
+    if meta is not None and meta.get("year") is not None:
+        return meta, "Crossref API (free, generous rate limits)"
+
+    # Keep Crossref partial results (authors found but no year) as a fallback pool
+    crossref_partial = meta  # may be None
 
     # 2. Elsevier (fallback)
     api_key = os.getenv("ELSEVIER_API_KEY")
+    if api_key:
+        els_meta = _metadata_from_elsevier(doi, api_key)
+        if els_meta is not None:
+            # Merge: use Crossref authors if Elsevier returned none
+            if not els_meta["authors"] and crossref_partial:
+                els_meta["authors"] = crossref_partial.get("authors", [])
+            return els_meta, "Elsevier API (rate-limited: 5 000 req/h)"
+
+    # Both failed or only Crossref partial data available
+    if crossref_partial is not None:
+        # We have authors but no year; return what we have
+        label = (
+            "Crossref API – authors only (year not found; "
+            + ("ELSEVIER_API_KEY not set" if not api_key else "Elsevier also failed")
+            + ")"
+        )
+        return crossref_partial, label
+
+    empty: dict = {"year": None, "authors": [], "countries": []}
     if not api_key:
-        return None, "Crossref returned no result and ELSEVIER_API_KEY is not set"
-
-    year = _year_from_elsevier(doi, api_key)
-    if year is not None:
-        return year, "Elsevier API (rate-limited: 5 000 req/h)"
-
-    return None, "Both Crossref and Elsevier returned no publication year for this DOI"
+        return empty, "Crossref returned no result and ELSEVIER_API_KEY is not set"
+    return empty, "Both Crossref and Elsevier returned no metadata for this DOI"
 
 
 # ---------------------------------------------------------------------------
 # CLI presentation
 # ---------------------------------------------------------------------------
 
-_BOX_WIDTH = 52  # inner width of the result box
+_BOX_WIDTH = 68  # inner width of the result box (wider to fit author names)
 
 
-def _print_result(doi: str, year: int | None, source: str) -> None:
+def _print_result(doi: str, meta: dict, source: str) -> None:
+    year      = meta.get("year")
+    authors   = meta.get("authors") or []
+    countries = meta.get("countries") or []
+
     top    = "┌" + "─" * _BOX_WIDTH + "┐"
     mid    = "├" + "─" * _BOX_WIDTH + "┤"
     bottom = "└" + "─" * _BOX_WIDTH + "┘"
 
     indent = 2
-    label_width = 10
-    value_indent = indent + label_width  # column where value text starts
+    label_width = 12
+    value_indent = indent + label_width
 
     def rows(label: str, value: str) -> list[str]:
         """Return one or more box rows, wrapping long values without truncation."""
         max_value_width = _BOX_WIDTH - value_indent
-        # Split value into chunks that fit the available width; break long words
         words = value.split()
         lines: list[str] = []
         current = ""
@@ -258,7 +353,6 @@ def _print_result(doi: str, year: int | None, source: str) -> None:
             else:
                 if current:
                     lines.append(current)
-                # Break a word that is longer than the available width across lines
                 while len(word) > max_value_width:
                     lines.append(word[:max_value_width])
                     word = word[max_value_width:]
@@ -270,27 +364,38 @@ def _print_result(doi: str, year: int | None, source: str) -> None:
 
         result = []
         for i, line in enumerate(lines):
+            content = " " * (indent if i == 0 else value_indent)
             if i == 0:
-                content = " " * indent + f"{label:<{label_width}}" + line
+                content += f"{label:<{label_width}}" + line
             else:
-                content = " " * value_indent + line
+                content += line
             result.append("│" + content.ljust(_BOX_WIDTH) + "│")
         return result
+
+    # Format authors as "Family G; Family G; ..." — truncate list display at 5
+    MAX_AUTHORS_SHOWN = 5
+    if authors:
+        shown = authors[:MAX_AUTHORS_SHOWN]
+        authors_str = "; ".join(shown)
+        if len(authors) > MAX_AUTHORS_SHOWN:
+            authors_str += f" … (+{len(authors) - MAX_AUTHORS_SHOWN} more)"
+    else:
+        authors_str = "N/A"
+
+    countries_str = "; ".join(countries) if countries else "N/A (not available via this API)"
 
     print(top)
     for line in rows("DOI:", doi):
         print(line)
     print(mid)
-    if year is not None:
-        for line in rows("Year:", str(year)):
-            print(line)
-        for line in rows("Source:", source):
-            print(line)
-    else:
-        for line in rows("Year:", "NOT FOUND"):
-            print(line)
-        for line in rows("Reason:", source):
-            print(line)
+    for line in rows("Year:", str(year) if year is not None else "NOT FOUND"):
+        print(line)
+    for line in rows("Authors:", authors_str):
+        print(line)
+    for line in rows("Countries:", countries_str):
+        print(line)
+    for line in rows("Source:", source):
+        print(line)
     print(bottom)
 
 
@@ -306,7 +411,6 @@ def main() -> None:
         print("Error: DOI argument is empty.", file=sys.stderr)
         sys.exit(1)
 
-    # Basic sanity check: a DOI starts with "10."
     if not doi.startswith("10."):
         print(f"Warning: '{doi}' does not look like a valid DOI (should start with '10.').",
               file=sys.stderr)
@@ -314,16 +418,19 @@ def main() -> None:
     print(f"DOI: {doi}")
     print("Querying APIs…")
 
-    year, source = get_year(doi)
+    meta, source = get_metadata(doi)
 
-    # Inline success/failure indication before the table
+    year      = meta.get("year")
+    authors   = meta.get("authors") or []
+    countries = meta.get("countries") or []
+
     if year is not None:
-        print(f"✓ Year = {year}  |  Source: {source}")
+        print(f"✓ Year = {year}  |  Authors: {len(authors)}  |  Countries: {len(countries) or 'N/A'}  |  Source: {source}")
     else:
-        print(f"✗ Could not retrieve year: {source}", file=sys.stderr)
+        print(f"✗ Year not found. Authors: {len(authors)}  |  Source: {source}", file=sys.stderr)
 
     print()
-    _print_result(doi, year, source)
+    _print_result(doi, meta, source)
 
     if year is None:
         sys.exit(2)
